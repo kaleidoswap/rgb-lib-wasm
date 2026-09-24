@@ -181,7 +181,8 @@ impl super::Wallet {
             db: payload.db,
             bdk_changeset: payload.bdk_changeset,
             transfer_artifacts: payload.transfer_artifacts,
-            received_consignments: payload.received_consignments,
+            // VERIFY ONLY: drop them so a restore can settle only through the re-fetch.
+            received_consignments: Default::default(),
             stock_stash_b64: None,
             stock_state_b64: None,
             stock_index_b64: None,
@@ -309,7 +310,8 @@ impl super::Wallet {
             db: payload.db,
             bdk_changeset: payload.bdk_changeset,
             transfer_artifacts: payload.transfer_artifacts,
-            received_consignments: payload.received_consignments,
+            // VERIFY ONLY: drop them so a restore can settle only through the re-fetch.
+            received_consignments: Default::default(),
             stock_stash_b64: None,
             stock_state_b64: None,
             stock_index_b64: None,
