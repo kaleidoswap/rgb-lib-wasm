@@ -212,3 +212,18 @@ If ports are already in use, stop existing containers:
 cd tests && bash regtest.sh stop
 docker ps  # check for leftover containers
 ```
+
+## Swap tests against a native maker
+
+`tests/swap_wasm.rs` takes an on-chain swap from the browser wallet against a native rgb-lib maker
+exposed over HTTP (the `swap-sim` binary of rgb-p2p-swaps). Build with the `camel_case` feature, the
+wire format the simulator speaks, and point the tests at the services with the `RGB_TEST_*` variables
+(`HELPER_URL`, `ESPLORA_URL`, `PROXY_URL`, `SWAP_SIM_URL`).
+
+On macOS the Xcode `ar` cannot index wasm objects, which breaks the link of `secp256k1-sys`. Use the
+Rust toolchain's `llvm-ar`:
+
+```bash
+AR_wasm32_unknown_unknown=$(ls ~/.rustup/toolchains/*/lib/rustlib/*/bin/llvm-ar | head -1) \
+  cargo test --target wasm32-unknown-unknown --features camel_case --test swap_wasm
+```

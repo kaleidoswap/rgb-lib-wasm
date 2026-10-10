@@ -1,9 +1,19 @@
 use base64::{Engine, engine::general_purpose};
 use serde::{Deserialize, Serialize};
 
-pub const REGTEST_HELPER_URL: &str = "http://127.0.0.1:8080";
-pub const ESPLORA_URL: &str = "http://127.0.0.1:8094/regtest/api";
-pub const PROXY_URL: &str = "http://127.0.0.1:3000/json-rpc";
+// the services can live elsewhere: build with e.g. RGB_TEST_ESPLORA_URL=http://host:port/path
+pub const REGTEST_HELPER_URL: &str = match option_env!("RGB_TEST_HELPER_URL") {
+    Some(url) => url,
+    None => "http://127.0.0.1:8080",
+};
+pub const ESPLORA_URL: &str = match option_env!("RGB_TEST_ESPLORA_URL") {
+    Some(url) => url,
+    None => "http://127.0.0.1:8094/regtest/api",
+};
+pub const PROXY_URL: &str = match option_env!("RGB_TEST_PROXY_URL") {
+    Some(url) => url,
+    None => "http://127.0.0.1:3000/json-rpc",
+};
 pub const VSS_SERVER_URL: &str = "http://127.0.0.1:8082/vss";
 
 #[derive(Serialize)]
