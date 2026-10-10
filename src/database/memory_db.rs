@@ -13,7 +13,7 @@ use crate::database::enums::{
 };
 use crate::database::{DbBatchTransferData, LocalRgbAllocation, LocalUnspent};
 use crate::error::InternalError;
-use crate::wallet::{Balance, Outpoint};
+use crate::wallet::{Balance, OnchainSwapRole, OnchainSwapStage, Outpoint};
 
 /// Lightweight ActiveValue (mirrors sea_orm::ActiveValue without the dependency).
 #[derive(Clone, Debug)]
@@ -23,7 +23,7 @@ pub enum ActiveValue<T> {
     NotSet,
 }
 
-impl<T: Default> Default for ActiveValue<T> {
+impl<T> Default for ActiveValue<T> {
     fn default() -> Self {
         ActiveValue::NotSet
     }
@@ -184,6 +184,42 @@ pub struct DbPendingWitnessScript {
 pub struct DbPendingWitnessScriptActMod {
     pub idx: ActiveValue<i32>,
     pub script: ActiveValue<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DbSwap {
+    pub idx: i32,
+    pub swap_id: String,
+    pub role: OnchainSwapRole,
+    pub stage: OnchainSwapStage,
+    pub expiration_timestamp: Option<i64>,
+    pub txid: Option<String>,
+    /// The swap messages, as JSON, as far as this wallet has seen them
+    pub offer: String,
+    pub request: Option<String>,
+    pub proposal: Option<String>,
+    pub completion: Option<String>,
+    /// Batch transfer recording this wallet's outgoing RGB leg, applied after broadcast
+    pub outgoing_batch_transfer_idx: Option<i32>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DbSwapActMod {
+    pub idx: ActiveValue<i32>,
+    pub swap_id: ActiveValue<String>,
+    pub role: ActiveValue<OnchainSwapRole>,
+    pub stage: ActiveValue<OnchainSwapStage>,
+    pub expiration_timestamp: ActiveValue<Option<i64>>,
+    pub txid: ActiveValue<Option<String>>,
+    pub offer: ActiveValue<String>,
+    pub request: ActiveValue<Option<String>>,
+    pub proposal: ActiveValue<Option<String>>,
+    pub completion: ActiveValue<Option<String>>,
+    pub outgoing_batch_transfer_idx: ActiveValue<Option<i32>>,
+    pub created_at: ActiveValue<i64>,
+    pub updated_at: ActiveValue<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -464,6 +500,15 @@ pub struct InMemoryDb {
     next_pending_witness_script_idx: RefCell<i32>,
     backup_info: RefCell<Option<DbBackupInfo>>,
     next_backup_info_idx: RefCell<i32>,
+    // absent from snapshots taken before swaps were stored
+    #[serde(default)]
+    swaps: RefCell<Vec<DbSwap>>,
+    #[serde(default = "first_idx")]
+    next_swap_idx: RefCell<i32>,
+}
+
+fn first_idx() -> RefCell<i32> {
+    RefCell::new(1)
 }
 
 impl InMemoryDb {
@@ -493,6 +538,8 @@ impl InMemoryDb {
             next_pending_witness_script_idx: RefCell::new(1),
             backup_info: RefCell::new(None),
             next_backup_info_idx: RefCell::new(1),
+            swaps: RefCell::new(Vec::new()),
+            next_swap_idx: RefCell::new(1),
         }
     }
 
@@ -604,6 +651,28 @@ impl InMemoryDb {
             script: av(p.script),
         };
         self.pending_witness_scripts.borrow_mut().push(row);
+        Ok(idx)
+    }
+
+    pub(crate) fn set_swap(&self, s: DbSwapActMod) -> Result<i32, InternalError> {
+        let idx = *self.next_swap_idx.borrow();
+        *self.next_swap_idx.borrow_mut() += 1;
+        let row = DbSwap {
+            idx,
+            swap_id: av(s.swap_id),
+            role: av_or(s.role, OnchainSwapRole::Maker),
+            stage: av_or(s.stage, OnchainSwapStage::Offered),
+            expiration_timestamp: av(s.expiration_timestamp),
+            txid: av(s.txid),
+            offer: av(s.offer),
+            request: av(s.request),
+            proposal: av(s.proposal),
+            completion: av(s.completion),
+            outgoing_batch_transfer_idx: av(s.outgoing_batch_transfer_idx),
+            created_at: av(s.created_at),
+            updated_at: av(s.updated_at),
+        };
+        self.swaps.borrow_mut().push(row);
         Ok(idx)
     }
 
@@ -844,6 +913,40 @@ impl InMemoryDb {
         Ok(row.clone())
     }
 
+    pub(crate) fn update_swap(&self, s: &mut DbSwapActMod) -> Result<DbSwap, InternalError> {
+        let swap_id = match &s.swap_id {
+            ActiveValue::Set(v) | ActiveValue::Unchanged(v) => v.clone(),
+            ActiveValue::NotSet => return Err(InternalError::Unexpected),
+        };
+        let mut swaps = self.swaps.borrow_mut();
+        let row = swaps
+            .iter_mut()
+            .find(|r| r.swap_id == swap_id)
+            .ok_or(InternalError::Unexpected)?;
+        if let ActiveValue::Set(v) = &s.stage {
+            row.stage = *v;
+        }
+        if let ActiveValue::Set(v) = &s.txid {
+            row.txid = v.clone();
+        }
+        if let ActiveValue::Set(v) = &s.request {
+            row.request = v.clone();
+        }
+        if let ActiveValue::Set(v) = &s.proposal {
+            row.proposal = v.clone();
+        }
+        if let ActiveValue::Set(v) = &s.completion {
+            row.completion = v.clone();
+        }
+        if let ActiveValue::Set(v) = &s.outgoing_batch_transfer_idx {
+            row.outgoing_batch_transfer_idx = *v;
+        }
+        if let ActiveValue::Set(v) = &s.updated_at {
+            row.updated_at = *v;
+        }
+        Ok(row.clone())
+    }
+
     pub(crate) fn update_transfer_transport_endpoint(
         &self,
         t: &mut DbTransferTransportEndpointActMod,
@@ -993,6 +1096,15 @@ impl InMemoryDb {
             .cloned())
     }
 
+    pub(crate) fn get_swap(&self, swap_id: &str) -> Result<Option<DbSwap>, InternalError> {
+        Ok(self
+            .swaps
+            .borrow()
+            .iter()
+            .find(|s| s.swap_id == swap_id)
+            .cloned())
+    }
+
     pub(crate) fn get_transport_endpoint(
         &self,
         endpoint: String,
@@ -1038,6 +1150,10 @@ impl InMemoryDb {
         &self,
     ) -> Result<Vec<DbPendingWitnessScript>, InternalError> {
         Ok(self.pending_witness_scripts.borrow().clone())
+    }
+
+    pub(crate) fn iter_swaps(&self) -> Result<Vec<DbSwap>, InternalError> {
+        Ok(self.swaps.borrow().clone())
     }
 
     pub(crate) fn iter_transfers(&self) -> Result<Vec<DbTransfer>, InternalError> {
@@ -1984,6 +2100,92 @@ mod tests {
         let remaining = db.iter_pending_witness_scripts().unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].script, "script_b");
+    }
+
+    // ── Swap ───────────────────────────────────────────────────────
+
+    fn make_swap_mod(swap_id: &str) -> DbSwapActMod {
+        DbSwapActMod {
+            swap_id: ActiveValue::Set(swap_id.to_string()),
+            role: ActiveValue::Set(OnchainSwapRole::Taker),
+            stage: ActiveValue::Set(OnchainSwapStage::Requested),
+            expiration_timestamp: ActiveValue::Set(Some(2000)),
+            offer: ActiveValue::Set("{\"offer\":true}".to_string()),
+            created_at: ActiveValue::Set(1000),
+            updated_at: ActiveValue::Set(1000),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_swap_set_get_update_iter() {
+        let db = make_db();
+        let first = db.set_swap(make_swap_mod("swap_a")).unwrap();
+        let second = db.set_swap(make_swap_mod("swap_b")).unwrap();
+        assert_eq!((first, second), (1, 2));
+        assert_eq!(db.iter_swaps().unwrap().len(), 2);
+        assert!(db.get_swap("missing").unwrap().is_none());
+
+        let row = db.get_swap("swap_a").unwrap().unwrap();
+        assert_eq!(row.role, OnchainSwapRole::Taker);
+        assert_eq!(row.stage, OnchainSwapStage::Requested);
+        assert!(row.proposal.is_none() && row.txid.is_none());
+
+        let updated = db
+            .update_swap(&mut DbSwapActMod {
+                swap_id: ActiveValue::Unchanged("swap_a".to_string()),
+                stage: ActiveValue::Set(OnchainSwapStage::Broadcast),
+                txid: ActiveValue::Set(Some("ab".repeat(32))),
+                proposal: ActiveValue::Set(Some("{}".to_string())),
+                updated_at: ActiveValue::Set(1500),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(updated.stage, OnchainSwapStage::Broadcast);
+        assert_eq!(updated.txid, Some("ab".repeat(32)));
+        assert_eq!(updated.updated_at, 1500);
+        // untouched columns keep their value, other swaps are left alone
+        assert_eq!(updated.offer, "{\"offer\":true}");
+        assert_eq!(
+            db.get_swap("swap_b").unwrap().unwrap().stage,
+            OnchainSwapStage::Requested
+        );
+    }
+
+    #[test]
+    fn test_swap_update_unknown_fails() {
+        let db = make_db();
+        let res = db.update_swap(&mut DbSwapActMod {
+            swap_id: ActiveValue::Unchanged("nope".to_string()),
+            stage: ActiveValue::Set(OnchainSwapStage::Cancelled),
+            ..Default::default()
+        });
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_swaps_survive_a_snapshot_round_trip() {
+        let db = make_db();
+        db.set_swap(make_swap_mod("swap_a")).unwrap();
+        let restored: InMemoryDb =
+            serde_json::from_str(&serde_json::to_string(&db).unwrap()).unwrap();
+        assert_eq!(
+            restored.get_swap("swap_a").unwrap(),
+            db.get_swap("swap_a").unwrap()
+        );
+        // the next row keeps counting from where the snapshot left off
+        assert_eq!(restored.set_swap(make_swap_mod("swap_b")).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_snapshot_from_before_swaps_still_loads() {
+        let mut json: serde_json::Value = serde_json::to_value(make_db()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("swaps");
+        obj.remove("next_swap_idx");
+        let restored: InMemoryDb = serde_json::from_value(json).unwrap();
+        assert!(restored.iter_swaps().unwrap().is_empty());
+        assert_eq!(restored.set_swap(make_swap_mod("swap_a")).unwrap(), 1);
     }
 
     // ── WalletTransaction ──────────────────────────────────────────

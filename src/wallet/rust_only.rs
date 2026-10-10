@@ -75,6 +75,33 @@ impl Wallet {
         coloring_info: ColoringInfo,
     ) -> Result<(Fascia, AssetBeneficiariesMap), Error> {
         info!(self.logger, "Coloring PSBT...");
+        let shift_output_map_for_opreturn_first = self.prepare_psbt_for_coloring(psbt)?;
+        let runtime = self.rgb_runtime()?;
+        let prev_outputs = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|txin| txin.previous_output)
+            .collect::<HashSet<OutPoint>>();
+        let static_blinding = coloring_info.static_blinding;
+        let asset_beneficiaries = self.color_psbt_stage_runtime(
+            &runtime,
+            psbt,
+            coloring_info,
+            prev_outputs,
+            false,
+            shift_output_map_for_opreturn_first,
+        )?;
+        let fascia = self.color_psbt_finalize(psbt, static_blinding)?;
+        info!(self.logger, "Color PSBT completed");
+        Ok((fascia, asset_beneficiaries))
+    }
+
+    /// Insert the OP_RETURN output if the PSBT has none.
+    ///
+    /// Returns whether `output_map` keys should be +1-shifted: `true` when any output is P2TR, as
+    /// the OP_RETURN is then placed first.
+    fn prepare_psbt_for_coloring(&self, psbt: &mut Psbt) -> Result<bool, Error> {
         let mut transaction = match psbt.clone().extract_tx() {
             Ok(tx) => tx,
             Err(ExtractTxError::MissingInputValue { tx }) => tx, // required for non-standard TXs
@@ -102,21 +129,24 @@ impl Wallet {
             *psbt = Psbt::from_unsigned_tx(transaction).unwrap();
         }
 
-        let runtime = self.rgb_runtime()?;
+        Ok(opreturn_first)
+    }
 
-        let prev_outputs = psbt
-            .unsigned_tx
-            .input
-            .iter()
-            .map(|txin| txin.previous_output)
-            .collect::<HashSet<OutPoint>>();
-
+    fn color_psbt_stage_runtime(
+        &self,
+        runtime: &RgbRuntime,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+        prev_outputs: HashSet<OutPoint>,
+        require_full_allocation: bool,
+        shift_output_map_for_opreturn_first: bool,
+    ) -> Result<AssetBeneficiariesMap, Error> {
         let mut all_transitions: HashMap<ContractId, Transition> = HashMap::new();
         let mut asset_beneficiaries: AssetBeneficiariesMap = bmap![];
         let assignment_name = FieldName::from(RGB_STATE_ASSET_OWNER);
 
         for (contract_id, asset_coloring_info) in coloring_info.asset_info_map.clone() {
-            let schema = AssetSchema::get_from_contract_id(contract_id, &runtime)?;
+            let schema = AssetSchema::get_from_contract_id(contract_id, runtime)?;
 
             let mut asset_transition_builder =
                 runtime.transition_builder(contract_id, "transfer")?;
@@ -139,11 +169,11 @@ impl Wallet {
                 if amount == 0 {
                     continue;
                 }
-                if opreturn_first {
+                if shift_output_map_for_opreturn_first {
                     vout += 1;
                 }
                 sending_amt += amount;
-                if vout as usize > psbt.outputs.len() {
+                if vout as usize >= psbt.outputs.len() {
                     return Err(Error::InvalidColoringInfo {
                         details: s!("invalid vout in output_map, does not exist in the given PSBT"),
                     });
@@ -173,6 +203,13 @@ impl Wallet {
                     ),
                 });
             }
+            if require_full_allocation && sending_amt < asset_available_amt {
+                return Err(Error::InvalidColoringInfo {
+                    details: format!(
+                        "total amount in output_map ({sending_amt}) less than available ({asset_available_amt}); full allocation required"
+                    ),
+                });
+            }
 
             if let Some(nonce) = coloring_info.nonce {
                 asset_transition_builder = asset_transition_builder.set_nonce(nonce);
@@ -181,22 +218,6 @@ impl Wallet {
             let transition = asset_transition_builder.complete_transition()?;
             all_transitions.insert(contract_id, transition);
             asset_beneficiaries.insert(contract_id, beneficiaries);
-        }
-
-        let opreturn_index = psbt
-            .unsigned_tx
-            .output
-            .iter()
-            .enumerate()
-            .find(|(_, o)| o.script_pubkey.is_op_return())
-            .expect("psbt should have an op_return output")
-            .0;
-        let opreturn_output = psbt.outputs.get_mut(opreturn_index).unwrap();
-        opreturn_output.set_opret_host();
-        if let Some(blinding) = coloring_info.static_blinding {
-            opreturn_output
-                .set_mpc_entropy(blinding)
-                .map_err(InternalError::from)?;
         }
 
         for (contract_id, transition) in all_transitions {
@@ -208,14 +229,129 @@ impl Wallet {
                 .map_err(InternalError::from)?;
         }
 
+        info!(self.logger, "Stage RGB coloring completed");
+        Ok(asset_beneficiaries)
+    }
+
+    /// Finalize the RGB commitment on a PSBT that has had one or more contracts staged via
+    /// [`Wallet::color_psbt_stage`]. Must be called exactly once per swap PSBT, after all staging
+    /// is complete.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn color_psbt_finalize(
+        &self,
+        psbt: &mut Psbt,
+        static_blinding: Option<u64>,
+    ) -> Result<Fascia, Error> {
+        info!(self.logger, "Finalizing RGB commitment on PSBT...");
+        let opreturn_index = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .enumerate()
+            .find(|(_, o)| o.script_pubkey.is_op_return())
+            .ok_or_else(|| Error::InvalidColoringInfo {
+                details: s!("PSBT has no OP_RETURN output to host the RGB commitment"),
+            })?
+            .0;
+        let opreturn_output = psbt.outputs.get_mut(opreturn_index).unwrap();
+        opreturn_output.set_opret_host();
+        if let Some(blinding) = static_blinding {
+            opreturn_output
+                .set_mpc_entropy(blinding)
+                .map_err(InternalError::from)?;
+        }
+
         psbt.set_rgb_close_method(CloseMethod::OpretFirst);
         psbt.set_as_unmodifiable();
         let fascia = psbt.rgb_commit().map_err(|e| Error::Internal {
             details: e.to_string(),
         })?;
 
-        info!(self.logger, "Color PSBT completed");
-        Ok((fascia, asset_beneficiaries))
+        info!(self.logger, "Finalize RGB commitment completed");
+        Ok(fascia)
+    }
+
+    /// Stage RGB coloring information onto a PSBT without finalizing the MPC commitment.
+    ///
+    /// Multiple parties may each call this method on the same PSBT (each for their own contracts),
+    /// in which case [`Wallet::color_psbt_finalize`] must be invoked once after all staging is
+    /// complete to produce the [`Fascia`]. `output_map` indexing follows [`Self::color_psbt`].
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn color_psbt_stage(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+    ) -> Result<AssetBeneficiariesMap, Error> {
+        info!(self.logger, "Staging RGB coloring onto PSBT...");
+        let prev_outputs = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|txin| txin.previous_output)
+            .collect::<HashSet<OutPoint>>();
+        let shift_output_map_for_opreturn_first = self.prepare_psbt_for_coloring(psbt)?;
+        let runtime = self.rgb_runtime()?;
+        self.color_psbt_stage_runtime(
+            &runtime,
+            psbt,
+            coloring_info,
+            prev_outputs,
+            false,
+            shift_output_map_for_opreturn_first,
+        )
+    }
+
+    /// Stage coloring spending only `prev_outputs`, requiring every allocation they carry to be
+    /// reassigned (no implicit burn).
+    pub(crate) fn color_psbt_stage_for_inputs(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+        prev_outputs: HashSet<OutPoint>,
+    ) -> Result<AssetBeneficiariesMap, Error> {
+        let runtime = self.rgb_runtime()?;
+        self.reject_uncolored_input_contracts(&runtime, &prev_outputs, &coloring_info)?;
+        let shift_output_map_for_opreturn_first = self.prepare_psbt_for_coloring(psbt)?;
+        self.color_psbt_stage_runtime(
+            &runtime,
+            psbt,
+            coloring_info,
+            prev_outputs,
+            true,
+            shift_output_map_for_opreturn_first,
+        )
+    }
+
+    /// Reject coloring that would silently burn the allocations of a contract that is spent by
+    /// `inputs` but not listed in `coloring_info`.
+    fn reject_uncolored_input_contracts(
+        &self,
+        runtime: &RgbRuntime,
+        inputs: &HashSet<OutPoint>,
+        coloring_info: &ColoringInfo,
+    ) -> Result<(), Error> {
+        let colored_contracts: BTreeSet<ContractId> =
+            coloring_info.asset_info_map.keys().copied().collect();
+        let assigning = runtime.contracts_assigning(inputs.iter().copied())?;
+        let uncolored: Vec<ContractId> =
+            assigning.difference(&colored_contracts).copied().collect();
+        if !uncolored.is_empty() {
+            let contracts = uncolored
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::InvalidColoringInfo {
+                details: format!(
+                    "PSBT inputs carry RGB allocations for contracts not listed in coloring_info: {contracts}"
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Color a PSBT, consume the RGB fascia and return the related consignment.
