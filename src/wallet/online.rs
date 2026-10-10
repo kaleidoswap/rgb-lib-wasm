@@ -4040,6 +4040,32 @@ impl Wallet {
             .map_err(Error::from)
     }
 
+    /// The counterparty's declared inputs must not be coins of this wallet: this wallet signs
+    /// every input it can, so a smuggled coin would be spent for the counterparty's benefit.
+    fn swap_ensure_inputs_foreign(
+        &self,
+        counterparty_inputs: &[OnchainSwapInput],
+        own_inputs: &[OnchainSwapInput],
+    ) -> Result<(), Error> {
+        for input in counterparty_inputs {
+            let outpoint = swap_input_to_outpoint(input);
+            if own_inputs
+                .iter()
+                .any(|own| swap_input_to_outpoint(own) == outpoint)
+                || self.bdk_wallet.get_utxo(outpoint).is_some()
+                || self
+                    .bdk_wallet
+                    .is_mine(swap_parse_script(&input.script_pubkey_hex)?)
+            {
+                return Err(swap_invalid(format!(
+                    "swap input {} belongs to this wallet",
+                    input.outpoint
+                )));
+            }
+        }
+        Ok(())
+    }
+
     async fn swap_ensure_inputs_confirmed(
         &self,
         inputs: &[OnchainSwapInput],
@@ -4635,6 +4661,7 @@ impl Wallet {
         if offer.bitcoin_network != self.bitcoin_network() {
             return Err(Error::BitcoinNetworkMismatch);
         }
+        self.swap_ensure_inputs_foreign(&proposal.maker_inputs, &proposal.request.taker_inputs)?;
         let mut psbt = Psbt::from_str(&proposal.psbt)?;
         swap_validate_proposal_psbt(&proposal, &psbt)?;
         if proposal.txid != psbt.unsigned_tx.compute_txid().to_string() {
@@ -4725,6 +4752,7 @@ impl Wallet {
                 ..Default::default()
             }),
         )?;
+        swap_ensure_only_own_inputs_signed(&psbt, &proposal.request.taker_inputs)?;
         let txid = psbt.unsigned_tx.compute_txid().to_string();
         let completion = OnchainSwapCompletion {
             psbt: psbt.to_string(),

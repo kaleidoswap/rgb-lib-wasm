@@ -3832,6 +3832,36 @@ pub(crate) fn swap_restore_input_metadata(
     Ok(())
 }
 
+/// After signing, make sure this wallet signed only the inputs it declared. A counterparty that
+/// smuggles one of this wallet's coins into the PSBT as its own input would otherwise have it
+/// spent.
+pub(crate) fn swap_ensure_only_own_inputs_signed(
+    psbt: &Psbt,
+    own_inputs: &[OnchainSwapInput],
+) -> Result<(), Error> {
+    let own = own_inputs
+        .iter()
+        .map(swap_input_to_outpoint)
+        .collect::<HashSet<_>>();
+    for (txin, input) in psbt.unsigned_tx.input.iter().zip(psbt.inputs.iter()) {
+        if own.contains(&txin.previous_output) {
+            continue;
+        }
+        if !input.partial_sigs.is_empty()
+            || input.final_script_sig.is_some()
+            || input.final_script_witness.is_some()
+            || input.tap_key_sig.is_some()
+            || !input.tap_script_sigs.is_empty()
+        {
+            return Err(swap_invalid(format!(
+                "the swap PSBT carries a signature on {}, which is not one of this wallet's inputs",
+                txin.previous_output
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn swap_validate_proposal_psbt(
     proposal: &OnchainSwapProposal,
     psbt: &Psbt,
@@ -4107,6 +4137,37 @@ mod swap_unit_tests {
                 .is_err()
         );
         assert!(swap_rgb_leg_coloring_info(&leg, &psbt, recipient_vout, None, 1, &exact).is_ok());
+    }
+
+    #[test]
+    fn only_the_declared_inputs_may_be_signed() {
+        let proposal = rgb_rgb_proposal();
+        let (mut psbt, _, _) = swap_build_psbt(&proposal).unwrap();
+        let own = proposal.request.taker_inputs.clone();
+        // unsigned: fine
+        swap_ensure_only_own_inputs_signed(&psbt, &own).unwrap();
+        // a signature on a declared input: fine
+        let own_outpoint = swap_input_to_outpoint(&own[0]);
+        let own_idx = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .position(|i| i.previous_output == own_outpoint)
+            .unwrap();
+        psbt.inputs[own_idx].final_script_witness = Some(Witness::new());
+        swap_ensure_only_own_inputs_signed(&psbt, &own).unwrap();
+        // a signature on the counterparty's input: refused, whatever kind of signature it is
+        let other_idx = 1 - own_idx;
+        psbt.inputs[other_idx].final_script_witness = Some(Witness::new());
+        let err = swap_ensure_only_own_inputs_signed(&psbt, &own).unwrap_err();
+        assert!(
+            err.to_string().contains("not one of this wallet's inputs"),
+            "{err}"
+        );
+        psbt.inputs[other_idx].final_script_witness = None;
+        psbt.inputs[other_idx].tap_key_sig =
+            Some(bdk_wallet::bitcoin::taproot::Signature::from_slice(&[1u8; 64]).unwrap());
+        assert!(swap_ensure_only_own_inputs_signed(&psbt, &own).is_err());
     }
 
     #[test]

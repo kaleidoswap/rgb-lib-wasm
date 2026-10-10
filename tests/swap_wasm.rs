@@ -353,6 +353,43 @@ async fn test_taker_refuses_a_tampered_proposal() {
 }
 
 #[wasm_bindgen_test]
+async fn test_taker_refuses_a_maker_that_declares_the_takers_coins_as_its_own() {
+    let (mut wallet, online, asset_id) = setup().await;
+    let offer = make_offer(&asset_id, 3600).await;
+    let request = wallet
+        .accept_swap_offer(online.clone(), offer, 0, false, vec![])
+        .await
+        .unwrap();
+    let proposal: OnchainSwapProposal = sim_post("/request", &json!({ "request": request })).await;
+
+    // the very same coin declared on the maker's side: the taker would sign it for the maker
+    let mut same_coin = proposal.clone();
+    same_coin.maker_inputs[0] = same_coin.request.taker_inputs[0].clone();
+    let err = wallet
+        .complete_swap_proposal(online.clone(), same_coin, 0, false)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("belongs to this wallet"), "{err}");
+
+    // another coin of the taker's: recognised by its script, whatever outpoint it is given
+    let mut other_coin = proposal.clone();
+    other_coin.maker_inputs[0].script_pubkey_hex =
+        proposal.request.taker_inputs[0].script_pubkey_hex.clone();
+    other_coin.maker_inputs[0].outpoint.vout += 7;
+    let err = wallet
+        .complete_swap_proposal(online.clone(), other_coin, 0, false)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("belongs to this wallet"), "{err}");
+
+    // the honest proposal still goes through
+    wallet
+        .complete_swap_proposal(online.clone(), proposal, 0, false)
+        .await
+        .unwrap();
+}
+
+#[wasm_bindgen_test]
 async fn test_taker_cancels_a_swap_it_has_not_completed() {
     let (mut wallet, online, asset_id) = setup().await;
     let offer = make_offer(&asset_id, 3600).await;
