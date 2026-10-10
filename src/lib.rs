@@ -84,12 +84,14 @@ use bdk_wallet::{
     ChangeSet, KeychainKind, LocalOutput, PersistedWallet, SignOptions, Wallet as BdkWallet,
     bitcoin::{
         Address as BdkAddress, Amount as BdkAmount, BlockHash, Network as BdkNetwork, NetworkKind,
-        OutPoint, OutPoint as BdkOutPoint, ScriptBuf, TxOut,
+        OutPoint, OutPoint as BdkOutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness,
+        absolute::LockTime,
         bip32::{ChildNumber, DerivationPath, Fingerprint, KeySource, Xpriv, Xpub},
         constants::ChainHash,
         hashes::{Hash as Sha256Hash, sha256},
         psbt::{ExtractTxError, Psbt},
         secp256k1::Secp256k1,
+        transaction::Version as TxVersion,
     },
     chain::{CanonicalizationParams, ChainPosition},
     descriptor::Segwitv0,
@@ -188,8 +190,8 @@ use crate::{
     utils::{
         DumbResolver, LOG_FILE, RgbRuntime, adjust_canonicalization, beneficiary_from_script_buf,
         from_str_or_number_mandatory, from_str_or_number_optional, get_account_xpubs,
-        get_descriptors, get_descriptors_from_xpubs, load_rgb_runtime, now, parse_address_str,
-        setup_logger, str_to_xpub,
+        get_descriptors, get_descriptors_from_xpubs, hash_bytes_hex, load_rgb_runtime, now,
+        parse_address_str, setup_logger, str_to_xpub,
     },
     wallet::{Balance, NUM_KNOWN_SCHEMAS, Outpoint, SCHEMA_ID_IFA, SCHEMA_ID_NIA},
 };
