@@ -356,6 +356,16 @@ pub(crate) fn get_descriptors_from_xpubs(
     Ok((descriptor_colored, descriptor_vanilla))
 }
 
+pub(crate) fn hash_bytes(data: &[u8]) -> Vec<u8> {
+    <sha256::Hash as Sha256Hash>::hash(data)
+        .to_byte_array()
+        .to_vec()
+}
+
+pub(crate) fn hash_bytes_hex(data: &[u8]) -> String {
+    hex::encode(hash_bytes(data))
+}
+
 pub(crate) fn parse_address_str(
     address: &str,
     bitcoin_network: BitcoinNetwork,
