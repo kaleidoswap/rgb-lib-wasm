@@ -3878,3 +3878,684 @@ impl Wallet {
         Ok(res)
     }
 }
+
+// ─── On-chain swap ───────────────────────────────────────────────────────────
+
+/// Only the direction where the maker gives RGB and the taker pays BTC is supported by this
+/// wallet for now: it never colors a swap PSBT.
+fn swap_ensure_supported(direction: SwapDirection) -> Result<(), Error> {
+    if direction != SwapDirection::RgbForBtc {
+        return Err(swap_invalid(
+            "this wallet only takes swaps where the maker gives RGB and the taker pays BTC",
+        ));
+    }
+    Ok(())
+}
+
+fn swap_validate_assignments_for_leg(
+    assignments: &[Assignment],
+    leg: &OnchainSwapLeg,
+) -> Result<(), Error> {
+    if !matches!(leg.kind, OnchainSwapLegKind::Rgb) {
+        return Ok(());
+    }
+    let total = assignments.iter().try_fold(0u64, |acc, assignment| {
+        acc.checked_add(assignment.main_amount())
+            .ok_or_else(|| swap_invalid("swap assignment amounts overflow"))
+    })?;
+    if total != leg.amount {
+        return Err(swap_invalid(format!(
+            "RGB swap assignment amount mismatch: expected {}, got {total}",
+            leg.amount
+        )));
+    }
+    Ok(())
+}
+
+fn swap_validate_witness_output(
+    consignment: &RgbTransfer,
+    witness_id: RgbTxid,
+    recipient_id: &str,
+    vout: u32,
+) -> Result<(), Error> {
+    let Some(anchored_bundle) = consignment
+        .bundles
+        .iter()
+        .find(|bundle| bundle.witness_id() == witness_id)
+    else {
+        return Err(swap_invalid(
+            "RGB swap consignment does not include the expected witness transaction",
+        ));
+    };
+    let PubWitness::Tx(tx) = &anchored_bundle.pub_witness else {
+        return Err(swap_invalid(
+            "RGB swap consignment is missing the witness transaction",
+        ));
+    };
+    let output = tx
+        .output
+        .get(vout as usize)
+        .ok_or_else(|| swap_invalid("RGB swap consignment missing expected output"))?;
+    let script_pubkey = script_buf_from_recipient_id(recipient_id.to_string())?
+        .ok_or_else(|| swap_invalid("RGB swap recipient ID is not witness-based"))?;
+    if output.script_pubkey != script_pubkey {
+        return Err(swap_invalid(
+            "RGB swap consignment output pays an unexpected script",
+        ));
+    }
+    Ok(())
+}
+
+fn swap_endpoint_proxy_url(endpoint: Option<&str>) -> Result<String, Error> {
+    let endpoint = endpoint.ok_or_else(|| Error::InvalidTransportEndpoints {
+        details: s!("swap consignment missing proxy endpoint"),
+    })?;
+    let transport = RgbTransport::from_str(endpoint)?;
+    Ok(TransportEndpoint::try_from(transport)?.endpoint)
+}
+
+impl Wallet {
+    fn swap_load<T: serde::de::DeserializeOwned>(
+        &self,
+        swap_id: &str,
+        column: impl Fn(&DbSwap) -> Option<&String>,
+        what: &str,
+    ) -> Result<T, Error> {
+        let swap = self
+            .database
+            .get_swap(swap_id)?
+            .ok_or_else(|| swap_invalid(format!("unknown swap {swap_id}")))?;
+        let serialized = column(&swap)
+            .ok_or_else(|| swap_invalid(format!("missing local swap {what} for {swap_id}")))?;
+        serde_json::from_str(serialized)
+            .map_err(InternalError::from)
+            .map_err(Error::from)
+    }
+
+    async fn swap_ensure_inputs_confirmed(
+        &self,
+        inputs: &[OnchainSwapInput],
+        min_confirmations: u8,
+    ) -> Result<(), Error> {
+        if min_confirmations == 0 {
+            return Ok(());
+        }
+        for input in inputs {
+            let confirmations = self
+                .indexer()
+                .get_tx_confirmations(&input.outpoint.txid)
+                .await?
+                .unwrap_or_default();
+            if confirmations < min_confirmations as u64 {
+                return Err(swap_invalid(format!(
+                    "swap input {} has {confirmations} confirmations, required {min_confirmations}",
+                    input.outpoint
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn swap_select_btc_inputs(
+        &self,
+        needed_sat: u64,
+        min_confirmations: u8,
+        excluded: &HashSet<(&str, u32)>,
+    ) -> Result<Vec<OnchainSwapInput>, Error> {
+        let mut selected = vec![];
+        let mut total = 0u64;
+        for output in self.internal_unspents().filter(|o| {
+            let txid = o.outpoint.txid.to_string();
+            !o.is_spent && !excluded.contains(&(txid.as_str(), o.outpoint.vout))
+        }) {
+            if min_confirmations > 0 {
+                let confs = self
+                    .indexer()
+                    .get_tx_confirmations(&output.outpoint.txid.to_string())
+                    .await?
+                    .unwrap_or_default();
+                if confs < min_confirmations as u64 {
+                    continue;
+                }
+            }
+            total = total
+                .checked_add(output.txout.value.to_sat())
+                .ok_or_else(|| swap_invalid("swap amounts overflow"))?;
+            selected.push(swap_build_input(&output));
+            if total >= needed_sat {
+                break;
+            }
+        }
+        if total < needed_sat {
+            return Err(Error::InsufficientBitcoins {
+                needed: needed_sat,
+                available: total,
+            });
+        }
+        Ok(selected)
+    }
+
+    /// Fetch the consignment a swap counterparty posted to the proxy, validate it against the
+    /// witness transaction and return it with the assignments it gives to `vout`.
+    async fn swap_fetch_received_transfer(
+        &mut self,
+        consignment: &OnchainSwapConsignment,
+        leg: &OnchainSwapLeg,
+        blinding: u64,
+    ) -> Result<(RgbTransfer, ValidTransfer, Vec<Assignment>), Error> {
+        let expected_asset_id = leg.asset_id.clone().expect("RGB leg has asset ID");
+        let witness_id = RgbTxid::from_str(&consignment.txid).map_err(|_| Error::InvalidTxid)?;
+        let proxy_url = swap_endpoint_proxy_url(consignment.endpoint.as_deref())?;
+        let consignment_res = self
+            ._get_consignment_async(&proxy_url, consignment.recipient_id.clone())
+            .await?;
+        let consignment_bytes = general_purpose::STANDARD
+            .decode(consignment_res.consignment)
+            .map_err(InternalError::from)?;
+        let transfer = RgbTransfer::load(&consignment_bytes[..]).map_err(InternalError::from)?;
+        let asset_id = transfer.contract_id().to_string();
+        if asset_id != expected_asset_id {
+            return Err(swap_invalid(format!(
+                "RGB swap consignment asset mismatch: expected {expected_asset_id}, got {asset_id}"
+            )));
+        }
+        let asset_schema: AssetSchema = transfer.schema_id().try_into()?;
+        self.check_schema_support(&asset_schema)?;
+
+        let mut runtime = self.rgb_runtime()?;
+        runtime.store_secret_seal(GraphSeal::with_blinded_vout(consignment.vout, blinding))?;
+        let wasm_resolver = WasmResolver::from_consignment(&transfer, self.chain_net());
+        let resolver = OffchainResolverWasm {
+            witness_id,
+            consignment: &transfer,
+            fallback: &wasm_resolver,
+        };
+        let validation_config = ValidationConfig {
+            chain_net: self.chain_net(),
+            trusted_typesystem: asset_schema.types(),
+            ..Default::default()
+        };
+        let valid_transfer = match transfer.clone().validate(&resolver, &validation_config) {
+            Ok(valid_transfer) => valid_transfer,
+            Err(ValidationError::InvalidConsignment(e)) => {
+                error!(self.logger, "Consignment is invalid: {}", e);
+                return Err(Error::InvalidConsignment);
+            }
+            Err(ValidationError::ResolverError(e)) => {
+                warn!(self.logger, "Network error during consignment validation");
+                return Err(Error::Network {
+                    details: e.to_string(),
+                });
+            }
+        };
+        swap_validate_witness_output(
+            &transfer,
+            witness_id,
+            &consignment.recipient_id,
+            consignment.vout,
+        )?;
+        let assignments = self
+            .extract_received_assignments(&transfer, witness_id, Some(consignment.vout), None)
+            .into_values()
+            .collect::<Vec<_>>();
+        if assignments.is_empty() {
+            return Err(swap_invalid(
+                "RGB swap consignment did not assign expected state",
+            ));
+        }
+        swap_validate_assignments_for_leg(&assignments, leg)?;
+        Ok((transfer, valid_transfer, assignments))
+    }
+
+    /// Accept a maker offer as the taker and return the taker's request message.
+    ///
+    /// The taker validates the offer, selects the BTC inputs it pays with and derives the
+    /// destination for the RGB asset it receives. Inputs in `exclude_outpoints` are never
+    /// selected. The returned [`OnchainSwapRequest`] must be forwarded to the maker.
+    ///
+    /// Only offers where the maker gives RGB and receives BTC are supported.
+    pub async fn accept_swap_offer(
+        &mut self,
+        online: Online,
+        offer: OnchainSwapOffer,
+        min_confirmations: u8,
+        skip_sync: bool,
+        exclude_outpoints: Vec<Outpoint>,
+    ) -> Result<OnchainSwapRequest, Error> {
+        info!(self.logger, "Accepting on-chain swap offer...");
+        self.check_online(online)?;
+        let direction = swap_validate_legs(&offer.maker_gives, &offer.maker_receives)?;
+        swap_ensure_supported(direction)?;
+        swap_validate_proxy_url(&offer.proxy_url)?;
+        swap_ensure_not_expired(&offer)?;
+        if offer.bitcoin_network != self.bitcoin_network() {
+            return Err(Error::BitcoinNetworkMismatch);
+        }
+        if self.database.get_swap(&offer.swap_id)?.is_some() {
+            return Err(swap_invalid(format!(
+                "swap {} was already accepted",
+                offer.swap_id
+            )));
+        }
+        if !skip_sync {
+            self.sync_db_txos(false).await?;
+        }
+        let taker_gives = offer.maker_receives.clone();
+        let needed = taker_gives
+            .amount
+            .checked_add(offer.rgb_output_sat)
+            .and_then(|v| v.checked_add(offer.network_fee_sat))
+            .and_then(|v| v.checked_add(offer.platform_fee_sat))
+            .ok_or_else(|| swap_invalid("swap amounts overflow"))?;
+        let excluded = exclude_outpoints
+            .iter()
+            .map(|o| (o.txid.as_str(), o.vout))
+            .collect::<HashSet<_>>();
+        let taker_inputs = self
+            .swap_select_btc_inputs(needed, min_confirmations, &excluded)
+            .await?;
+        let script = self
+            ._get_new_address(KeychainKind::External)?
+            .script_pubkey();
+        let taker_rgb_recipient_id =
+            recipient_id_from_script_buf(script.clone(), self.bitcoin_network());
+        let taker_change_script_pubkey_hex = self
+            ._get_new_address(KeychainKind::Internal)?
+            .script_pubkey()
+            .to_hex_string();
+        let request = OnchainSwapRequest {
+            offer,
+            taker_inputs,
+            taker_btc_address: None,
+            taker_rgb_recipient_id: Some(taker_rgb_recipient_id),
+            taker_rgb_script_pubkey_hex: Some(script.to_hex_string()),
+            taker_rgb_blinding: Some(swap_random_blinding()),
+            taker_change_script_pubkey_hex,
+        };
+        let created_at = now().unix_timestamp();
+        self.database.set_swap(DbSwapActMod {
+            swap_id: ActiveValue::Set(request.offer.swap_id.clone()),
+            role: ActiveValue::Set(OnchainSwapRole::Taker),
+            stage: ActiveValue::Set(OnchainSwapStage::Requested),
+            expiration_timestamp: ActiveValue::Set(
+                request.offer.expiration_timestamp.map(|e| e as i64),
+            ),
+            offer: ActiveValue::Set(
+                serde_json::to_string(&request.offer).map_err(InternalError::from)?,
+            ),
+            request: ActiveValue::Set(Some(
+                serde_json::to_string(&request).map_err(InternalError::from)?,
+            )),
+            created_at: ActiveValue::Set(created_at),
+            updated_at: ActiveValue::Set(created_at),
+            ..Default::default()
+        })?;
+        self.update_backup_info(false)?;
+        self.flush().await?;
+        info!(self.logger, "Accept swap offer completed");
+        Ok(request)
+    }
+
+    /// Complete a maker proposal as the taker.
+    ///
+    /// The taker checks that the PSBT is exactly the one the agreed terms produce (including the
+    /// platform fee output), that the maker's RGB consignment gives it the agreed asset at the
+    /// agreed output, and only then signs. The maker always signs last, so the returned
+    /// [`OnchainSwapCompletion`] is never broadcastable by the taker.
+    pub async fn complete_swap_proposal(
+        &mut self,
+        online: Online,
+        proposal: OnchainSwapProposal,
+        min_confirmations: u8,
+        skip_sync: bool,
+    ) -> Result<OnchainSwapCompletion, Error> {
+        info!(self.logger, "Completing on-chain swap proposal...");
+        self.check_online(online)?;
+        let offer = &proposal.request.offer;
+        let local_request: OnchainSwapRequest =
+            self.swap_load(&offer.swap_id, |s| s.request.as_ref(), "request")?;
+        swap_ensure_state_matches(&local_request, &proposal.request, "request")?;
+        let direction = swap_validate_legs(&offer.maker_gives, &offer.maker_receives)?;
+        swap_ensure_supported(direction)?;
+        swap_validate_proxy_url(&offer.proxy_url)?;
+        swap_ensure_not_expired(offer)?;
+        if offer.bitcoin_network != self.bitcoin_network() {
+            return Err(Error::BitcoinNetworkMismatch);
+        }
+        let mut psbt = Psbt::from_str(&proposal.psbt)?;
+        swap_validate_proposal_psbt(&proposal, &psbt)?;
+        if proposal.txid != psbt.unsigned_tx.compute_txid().to_string() {
+            return Err(swap_invalid("swap proposal txid mismatch"));
+        }
+        let (_expected_psbt, _maker_rgb_vout, taker_rgb_vout) = swap_build_psbt(&proposal)?;
+        let all_inputs = proposal
+            .maker_inputs
+            .iter()
+            .chain(proposal.request.taker_inputs.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        swap_restore_input_metadata(&mut psbt, &all_inputs)?;
+
+        let vout = taker_rgb_vout.ok_or_else(|| swap_invalid("missing taker RGB vout"))?;
+        let blinding = proposal
+            .request
+            .taker_rgb_blinding
+            .ok_or_else(|| swap_invalid("missing taker RGB blinding"))?;
+        let recipient_id = proposal
+            .request
+            .taker_rgb_recipient_id
+            .as_deref()
+            .ok_or_else(|| swap_invalid("missing taker RGB recipient ID"))?;
+        let asset_id = offer
+            .maker_gives
+            .asset_id
+            .as_deref()
+            .expect("RGB leg has asset ID");
+        let matching = proposal
+            .consignments
+            .iter()
+            .filter(|c| c.asset_id == asset_id)
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Err(swap_invalid(format!(
+                "expected exactly one RGB swap consignment for {asset_id}, got {}",
+                matching.len()
+            )));
+        }
+        let consignment = matching[0];
+        if consignment.txid != proposal.txid
+            || consignment.vout != vout
+            || consignment.blinding != blinding
+            || consignment.recipient_id != recipient_id
+        {
+            return Err(swap_invalid(
+                "RGB swap consignment does not match the swap output",
+            ));
+        }
+        self.swap_fetch_received_transfer(consignment, &offer.maker_gives, blinding)
+            .await?;
+
+        if !skip_sync {
+            self.sync_db_txos(false).await?;
+        }
+        self.swap_ensure_inputs_confirmed(&proposal.maker_inputs, min_confirmations)
+            .await?;
+        self.swap_ensure_inputs_confirmed(&proposal.request.taker_inputs, min_confirmations)
+            .await?;
+        self._sign_psbt(
+            &mut psbt,
+            Some(SignOptions {
+                trust_witness_utxo: true,
+                ..Default::default()
+            }),
+        )?;
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        let consignments = proposal.consignments.clone();
+        let completion = OnchainSwapCompletion {
+            psbt: psbt.to_string(),
+            finalized_psbt: None,
+            txid,
+            consignments,
+            taker_history: None,
+            proposal,
+        };
+        info!(self.logger, "Complete swap proposal completed");
+        Ok(completion)
+    }
+
+    /// Record the received RGB leg of a swap as a transfer waiting for the swap transaction to
+    /// confirm. The consignment was validated and accepted synchronously, so refreshing only has
+    /// to follow the confirmations.
+    fn swap_record_incoming(
+        &self,
+        asset_id: &str,
+        txid: &str,
+        vout: u32,
+        btc_amount_sat: u64,
+        assignments: &[Assignment],
+    ) -> Result<(), Error> {
+        let created_at = now().unix_timestamp();
+        let batch_transfer_idx = self.database.set_batch_transfer(DbBatchTransferActMod {
+            txid: ActiveValue::Set(Some(txid.to_string())),
+            status: ActiveValue::Set(TransferStatus::WaitingConfirmations),
+            expiration: ActiveValue::Set(None),
+            created_at: ActiveValue::Set(created_at),
+            min_confirmations: ActiveValue::Set(1),
+            ..Default::default()
+        })?;
+        let asset_transfer_idx = self.database.set_asset_transfer(DbAssetTransferActMod {
+            user_driven: ActiveValue::Set(true),
+            batch_transfer_idx: ActiveValue::Set(batch_transfer_idx),
+            asset_id: ActiveValue::Set(Some(asset_id.to_string())),
+            ..Default::default()
+        })?;
+        let outpoint = Outpoint {
+            txid: txid.to_string(),
+            vout,
+        };
+        let txo_idx = match self.database.get_txo(&outpoint)? {
+            Some(txo) => txo.idx,
+            None => {
+                self.database.set_txo(DbTxoActMod {
+                    txid: ActiveValue::Set(txid.to_string()),
+                    vout: ActiveValue::Set(vout),
+                    btc_amount: ActiveValue::Set(btc_amount_sat.to_string()),
+                    spent: ActiveValue::Set(false),
+                    exists: ActiveValue::Set(false),
+                    pending_witness: ActiveValue::Set(true),
+                    ..Default::default()
+                })?;
+                self.database
+                    .get_txo(&outpoint)?
+                    .map(|t| t.idx)
+                    .ok_or_else(|| swap_invalid("failed to locate swap output txo after insert"))?
+            }
+        };
+        for assignment in assignments {
+            self.database.set_coloring(DbColoringActMod {
+                txo_idx: ActiveValue::Set(txo_idx),
+                asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                r#type: ActiveValue::Set(ColoringType::Receive),
+                assignment: ActiveValue::Set(assignment.clone()),
+                ..Default::default()
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Make the broadcast swap TX known to BDK: parties that did not broadcast it would not
+    /// discover it with a sync, leaving their swap outputs unknown.
+    async fn swap_apply_witness_tx(
+        &mut self,
+        completion: &OnchainSwapCompletion,
+    ) -> Result<(), Error> {
+        let finalized_psbt = completion
+            .finalized_psbt
+            .as_deref()
+            .ok_or_else(|| swap_invalid("swap completion is not finalized"))?;
+        let psbt = Psbt::from_str(finalized_psbt)?;
+        swap_validate_proposal_psbt(&completion.proposal, &psbt)?;
+        let tx = psbt.extract_tx().map_err(InternalError::from)?;
+        if tx.compute_txid().to_string() != completion.txid {
+            return Err(swap_invalid("swap completion txid mismatch"));
+        }
+        if self
+            .indexer()
+            .get_tx_confirmations(&completion.txid)
+            .await?
+            .is_none()
+        {
+            return Err(swap_invalid("swap transaction is not known to the indexer"));
+        }
+        let seen_at = now().unix_timestamp() as u64;
+        self.bdk_wallet.apply_unconfirmed_txs([(tx, seen_at)]);
+        self.bdk_wallet.persist(&mut self.bdk_database)?;
+        Ok(())
+    }
+
+    /// Accept the RGB transfer received from a completed on-chain swap.
+    ///
+    /// Call it as the taker once the maker has broadcast the swap transaction. The consignment
+    /// the maker posted is validated and accepted into the wallet's RGB state. Returns the
+    /// [`Assignment`]s received.
+    pub async fn accept_swap_transfers(
+        &mut self,
+        online: Online,
+        completion: OnchainSwapCompletion,
+        role: OnchainSwapRole,
+        skip_sync: bool,
+    ) -> Result<OnchainSwapReceiveResult, Error> {
+        info!(self.logger, "Accepting on-chain swap transfers...");
+        self.check_online(online)?;
+        let offer = &completion.proposal.request.offer;
+        if role != OnchainSwapRole::Taker {
+            return Err(swap_invalid("this wallet can only take swaps"));
+        }
+        let direction = swap_validate_legs(&offer.maker_gives, &offer.maker_receives)?;
+        swap_ensure_supported(direction)?;
+        swap_validate_proxy_url(&offer.proxy_url)?;
+        let local_request: OnchainSwapRequest =
+            self.swap_load(&offer.swap_id, |s| s.request.as_ref(), "request")?;
+        swap_ensure_state_matches(&local_request, &completion.proposal.request, "request")?;
+        self.swap_apply_witness_tx(&completion).await?;
+        if !skip_sync {
+            self.sync_db_txos(false).await?;
+        }
+        let receives = &offer.maker_gives;
+        let matching = completion
+            .consignments
+            .iter()
+            .filter(|c| receives.asset_id.as_deref() == Some(c.asset_id.as_str()))
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Err(swap_invalid(format!(
+                "expected exactly one RGB swap consignment, got {}",
+                matching.len()
+            )));
+        }
+        let consignment = matching[0];
+        let blinding = completion
+            .proposal
+            .request
+            .taker_rgb_blinding
+            .ok_or_else(|| swap_invalid("missing taker RGB blinding"))?;
+        if consignment.txid != completion.txid
+            || consignment.recipient_id
+                != completion
+                    .proposal
+                    .request
+                    .taker_rgb_recipient_id
+                    .clone()
+                    .unwrap_or_default()
+            || consignment.blinding != blinding
+        {
+            return Err(swap_invalid(
+                "RGB swap consignment does not match the swap output",
+            ));
+        }
+        let (transfer, valid_transfer, assignments) = self
+            .swap_fetch_received_transfer(consignment, receives, blinding)
+            .await?;
+
+        let witness_id = RgbTxid::from_str(&consignment.txid).map_err(|_| Error::InvalidTxid)?;
+        let contract_id = transfer.contract_id();
+        let asset_schema: AssetSchema = transfer.schema_id().try_into()?;
+        let wasm_resolver = WasmResolver::from_consignment(&transfer, self.chain_net());
+        let resolver = OffchainResolverWasm {
+            witness_id,
+            consignment: &transfer,
+            fallback: &wasm_resolver,
+        };
+        let mut runtime = self.rgb_runtime()?;
+        runtime.store_secret_seal(GraphSeal::with_blinded_vout(consignment.vout, blinding))?;
+        let valid_contract = valid_transfer.clone().into_valid_contract();
+        runtime
+            .import_contract(valid_contract.clone(), &resolver)
+            .expect("failure importing validated contract");
+        if self.database.get_asset(contract_id.to_string())?.is_none() {
+            self.save_new_asset_internal(
+                &runtime,
+                contract_id,
+                asset_schema,
+                valid_contract,
+                valid_transfer.clone(),
+            )?;
+        }
+        runtime.accept_transfer(valid_transfer, &resolver)?;
+        drop(runtime);
+        self.swap_record_incoming(
+            &contract_id.to_string(),
+            &consignment.txid,
+            consignment.vout,
+            offer.rgb_output_sat,
+            &assignments,
+        )?;
+        self.database.update_swap(&mut DbSwapActMod {
+            swap_id: ActiveValue::Unchanged(offer.swap_id.clone()),
+            stage: ActiveValue::Set(OnchainSwapStage::Accepted),
+            txid: ActiveValue::Set(Some(completion.txid.clone())),
+            completion: ActiveValue::Set(Some(
+                serde_json::to_string(&completion).map_err(InternalError::from)?,
+            )),
+            updated_at: ActiveValue::Set(now().unix_timestamp()),
+            ..Default::default()
+        })?;
+        self.update_backup_info(false)?;
+        self.flush().await?;
+        info!(self.logger, "Accept swap transfers completed");
+        Ok(OnchainSwapReceiveResult { assignments })
+    }
+
+    /// Cancel an on-chain swap whose transaction this wallet has not seen broadcast.
+    ///
+    /// Returns [`Error::CannotFailBatchTransfer`] once the swap transaction is known to the
+    /// indexer or the swap has been settled. A maker holding a fully signed transaction can still
+    /// broadcast it: to rule that out, spend the inputs.
+    pub async fn cancel_swap(&mut self, online: Online, swap_id: String) -> Result<(), Error> {
+        info!(self.logger, "Cancelling on-chain swap {swap_id}...");
+        self.check_online(online)?;
+        let swap = self
+            .database
+            .get_swap(&swap_id)?
+            .ok_or_else(|| swap_invalid(format!("unknown swap {swap_id}")))?;
+        if matches!(
+            swap.stage,
+            OnchainSwapStage::Broadcast | OnchainSwapStage::Accepted
+        ) {
+            return Err(Error::CannotFailBatchTransfer);
+        }
+        if let Some(txid) = &swap.txid
+            && self.indexer().get_tx_confirmations(txid).await?.is_some()
+        {
+            return Err(Error::CannotFailBatchTransfer);
+        }
+        self.database.update_swap(&mut DbSwapActMod {
+            swap_id: ActiveValue::Unchanged(swap_id),
+            stage: ActiveValue::Set(OnchainSwapStage::Cancelled),
+            updated_at: ActiveValue::Set(now().unix_timestamp()),
+            ..Default::default()
+        })?;
+        self.update_backup_info(false)?;
+        self.flush().await?;
+        info!(self.logger, "Cancel swap completed");
+        Ok(())
+    }
+
+    /// List the on-chain swaps this wallet has state for, including cancelled ones.
+    pub fn list_swaps(&self) -> Result<Vec<OnchainSwapSummary>, Error> {
+        let mut swaps = self
+            .database
+            .iter_swaps()?
+            .into_iter()
+            .map(|s| OnchainSwapSummary {
+                swap_id: s.swap_id,
+                role: s.role,
+                stage: s.stage,
+                expiration_timestamp: s.expiration_timestamp.map(|e| e as u64),
+                txid: s.txid,
+            })
+            .collect::<Vec<_>>();
+        swaps.sort_by(|a, b| a.swap_id.cmp(&b.swap_id));
+        Ok(swaps)
+    }
+}

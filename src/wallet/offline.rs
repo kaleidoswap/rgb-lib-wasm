@@ -2156,7 +2156,11 @@ impl Wallet {
         Ok(psbt.to_string())
     }
 
-    fn _sign_psbt(&self, psbt: &mut Psbt, sign_options: Option<SignOptions>) -> Result<(), Error> {
+    pub(crate) fn _sign_psbt(
+        &self,
+        psbt: &mut Psbt,
+        sign_options: Option<SignOptions>,
+    ) -> Result<(), Error> {
         let sign_options = sign_options.unwrap_or_default();
         self.bdk_wallet
             .sign(psbt, sign_options)

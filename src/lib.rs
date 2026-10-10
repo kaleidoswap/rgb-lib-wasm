@@ -163,9 +163,9 @@ use typenum::consts::U32;
 use crate::database::{
     DbAsset, DbAssetActMod, DbAssetTransfer, DbAssetTransferActMod, DbBackupInfo,
     DbBackupInfoActMod, DbBatchTransfer, DbBatchTransferActMod, DbColoring, DbColoringActMod,
-    DbMedia, DbMediaActMod, DbPendingWitnessScriptActMod, DbTransfer, DbTransferActMod,
-    DbTransferTransportEndpoint, DbTransferTransportEndpointActMod, DbTransportEndpoint,
-    DbTransportEndpointActMod, DbTxo,
+    DbMedia, DbMediaActMod, DbPendingWitnessScriptActMod, DbSwap, DbSwapActMod, DbTransfer,
+    DbTransferActMod, DbTransferTransportEndpoint, DbTransferTransportEndpointActMod,
+    DbTransportEndpoint, DbTransportEndpointActMod, DbTxo,
 };
 #[cfg(feature = "esplora")]
 use crate::database::{DbTxoActMod, DbWalletTransactionActMod};
@@ -191,7 +191,7 @@ use crate::{
         DumbResolver, LOG_FILE, RgbRuntime, adjust_canonicalization, beneficiary_from_script_buf,
         from_str_or_number_mandatory, from_str_or_number_optional, get_account_xpubs,
         get_descriptors, get_descriptors_from_xpubs, hash_bytes_hex, load_rgb_runtime, now,
-        parse_address_str, setup_logger, str_to_xpub,
+        parse_address_str, recipient_id_from_script_buf, setup_logger, str_to_xpub,
     },
     wallet::{Balance, NUM_KNOWN_SCHEMAS, Outpoint, SCHEMA_ID_IFA, SCHEMA_ID_NIA},
 };
