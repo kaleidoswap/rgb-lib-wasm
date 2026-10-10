@@ -201,6 +201,9 @@ pub struct DbSwap {
     pub completion: Option<String>,
     /// Batch transfer recording this wallet's outgoing RGB leg, applied after broadcast
     pub outgoing_batch_transfer_idx: Option<i32>,
+    /// The fascia of this wallet's outgoing RGB leg, consumed once the swap is broadcast
+    #[serde(default)]
+    pub outgoing_fascia: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -218,6 +221,7 @@ pub struct DbSwapActMod {
     pub proposal: ActiveValue<Option<String>>,
     pub completion: ActiveValue<Option<String>>,
     pub outgoing_batch_transfer_idx: ActiveValue<Option<i32>>,
+    pub outgoing_fascia: ActiveValue<Option<String>>,
     pub created_at: ActiveValue<i64>,
     pub updated_at: ActiveValue<i64>,
 }
@@ -669,6 +673,7 @@ impl InMemoryDb {
             proposal: av(s.proposal),
             completion: av(s.completion),
             outgoing_batch_transfer_idx: av(s.outgoing_batch_transfer_idx),
+            outgoing_fascia: av(s.outgoing_fascia),
             created_at: av(s.created_at),
             updated_at: av(s.updated_at),
         };
@@ -940,6 +945,9 @@ impl InMemoryDb {
         }
         if let ActiveValue::Set(v) = &s.outgoing_batch_transfer_idx {
             row.outgoing_batch_transfer_idx = *v;
+        }
+        if let ActiveValue::Set(v) = &s.outgoing_fascia {
+            row.outgoing_fascia = v.clone();
         }
         if let ActiveValue::Set(v) = &s.updated_at {
             row.updated_at = *v;

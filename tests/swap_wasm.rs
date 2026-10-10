@@ -114,6 +114,155 @@ async fn make_offer(asset_id: &str, expiry_in: u64) -> OnchainSwapOffer {
     .await
 }
 
+/// A funded taker wallet that holds `ASSET_AMOUNT` of a freshly issued asset.
+async fn setup_holder() -> (Wallet, rgb_lib_wasm::wallet::Online, String) {
+    let mut wallet = Wallet::new(test_wallet_data()).unwrap();
+    let online = wallet
+        .go_online(false, ESPLORA_URL.to_string())
+        .await
+        .unwrap();
+    let address = wallet.get_address().unwrap();
+    fund_address(&address, "1").await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    let unsigned = wallet
+        .create_utxos_begin(online.clone(), true, Some(3), Some(10_000), 1, true)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    wallet
+        .create_utxos_end(online.clone(), signed, true)
+        .await
+        .unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    let asset = wallet
+        .issue_asset_nia(
+            "SELL".to_string(),
+            "Sell".to_string(),
+            0,
+            vec![ASSET_AMOUNT],
+        )
+        .unwrap();
+    (wallet, online, asset.asset_id)
+}
+
+async fn make_buy_offer(asset_id: &str, amount: u64) -> OnchainSwapOffer {
+    let expiry = (js_sys::Date::now() / 1000.0) as u64 + 3600;
+    sim_post(
+        "/offer",
+        &json!({
+            "assetId": asset_id,
+            "amount": amount,
+            "priceSat": PRICE_SAT,
+            "networkFeeSat": NETWORK_FEE_SAT,
+            "expiry": expiry,
+            "side": "buy",
+        }),
+    )
+    .await
+}
+
+#[wasm_bindgen_test]
+async fn test_taker_sells_rgb_to_a_native_maker() {
+    let maker_address: String = sim_get("/address").await;
+    fund_address(&maker_address, "1").await;
+    wait_for_esplora_sync().await;
+    let (mut wallet, online, asset_id) = setup_holder().await;
+    let btc_before = wallet
+        .get_btc_balance(Some(online.clone()), true)
+        .unwrap()
+        .vanilla
+        .spendable;
+
+    // the maker buys 400 of the 1000 units: the rest comes back to the seller as change
+    let sold = 400u64;
+    let offer = make_buy_offer(&asset_id, sold).await;
+    let request = wallet
+        .accept_swap_offer(online.clone(), offer, 0, false, vec![])
+        .await
+        .unwrap();
+    let proposal: OnchainSwapProposal = sim_post("/request", &json!({ "request": request })).await;
+    let completion = wallet
+        .complete_swap_proposal(online.clone(), proposal, 0, false)
+        .await
+        .unwrap();
+    // the RGB leg is colored and its consignment is on the proxy. The batch is only prepared:
+    // the settled balance is untouched and the pending view already shows the change
+    assert_eq!(completion.consignments.len(), 1);
+    assert!(completion.finalized_psbt.is_none());
+    let pending = wallet.get_asset_balance(asset_id.clone()).unwrap();
+    assert_eq!(
+        (pending.settled, pending.future),
+        (ASSET_AMOUNT, ASSET_AMOUNT - sold)
+    );
+
+    // the maker validates the consignment, signs last and broadcasts
+    let done: OnchainSwapCompletion =
+        sim_post("/completion", &json!({ "completion": completion })).await;
+    assert!(done.finalized_psbt.is_some());
+    wait_for_esplora_sync().await;
+
+    let received = wallet
+        .accept_swap_transfers(online.clone(), done.clone(), OnchainSwapRole::Taker, false)
+        .await
+        .unwrap();
+    assert!(received.assignments.is_empty());
+    let settled: usize = sim_post("/settle", &json!({ "completion": done })).await;
+    assert!(settled > 0);
+
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    // what is left is exactly the change; the BTC price landed in the wallet
+    assert_eq!(
+        wallet.get_asset_balance(asset_id.clone()).unwrap().future,
+        ASSET_AMOUNT - sold
+    );
+    let btc_after = wallet
+        .get_btc_balance(Some(online.clone()), true)
+        .unwrap()
+        .vanilla
+        .spendable;
+    assert!(
+        btc_after >= btc_before + PRICE_SAT - 2 * NETWORK_FEE_SAT,
+        "{btc_before} -> {btc_after}"
+    );
+    let maker: serde_json::Value = sim_get(&format!("/balance?assetId={asset_id}")).await;
+    assert_eq!(maker["assetFuture"], sold);
+    assert_eq!(
+        wallet.list_swaps().unwrap()[0].stage,
+        OnchainSwapStage::Accepted
+    );
+}
+
+#[wasm_bindgen_test]
+async fn test_taker_abandons_a_sale_and_keeps_its_asset() {
+    let (mut wallet, online, asset_id) = setup_holder().await;
+    let offer = make_buy_offer(&asset_id, ASSET_AMOUNT).await;
+    let swap_id = offer.swap_id.clone();
+    let request = wallet
+        .accept_swap_offer(online.clone(), offer, 0, false, vec![])
+        .await
+        .unwrap();
+    let proposal: OnchainSwapProposal = sim_post("/request", &json!({ "request": request })).await;
+    wallet
+        .complete_swap_proposal(online.clone(), proposal, 0, false)
+        .await
+        .unwrap();
+    // never broadcast: cancelling puts everything back
+    wallet.cancel_swap(online.clone(), swap_id).await.unwrap();
+    assert_eq!(
+        wallet.list_swaps().unwrap()[0].stage,
+        OnchainSwapStage::Cancelled
+    );
+    assert_eq!(
+        wallet.get_asset_balance(asset_id).unwrap().spendable,
+        ASSET_AMOUNT
+    );
+}
+
 #[wasm_bindgen_test]
 async fn test_taker_buys_rgb_from_a_native_maker() {
     let (mut wallet, online, asset_id) = setup().await;

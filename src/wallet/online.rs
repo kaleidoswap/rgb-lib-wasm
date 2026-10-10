@@ -3881,15 +3881,83 @@ impl Wallet {
 
 // ─── On-chain swap ───────────────────────────────────────────────────────────
 
-/// Only the direction where the maker gives RGB and the taker pays BTC is supported by this
-/// wallet for now: it never colors a swap PSBT.
+/// This wallet takes swaps between RGB and BTC; RGB-for-RGB swaps are not supported.
 fn swap_ensure_supported(direction: SwapDirection) -> Result<(), Error> {
-    if direction != SwapDirection::RgbForBtc {
+    if direction == SwapDirection::RgbForRgb {
         return Err(swap_invalid(
-            "this wallet only takes swaps where the maker gives RGB and the taker pays BTC",
+            "this wallet does not support RGB-for-RGB swaps",
         ));
     }
     Ok(())
+}
+
+/// The RGB leg a wallet sends in a swap, with the inputs it spends.
+struct SwapRgbSend<'a> {
+    leg: &'a OnchainSwapLeg,
+    inputs: &'a [OnchainSwapInput],
+    change_script_hex: &'a str,
+    recipient_id: &'a str,
+    recipient_vout: u32,
+    blinding: u64,
+}
+
+impl SwapRgbSend<'_> {
+    fn input_outpoints(&self) -> HashSet<BdkOutPoint> {
+        self.inputs.iter().map(swap_input_to_outpoint).collect()
+    }
+
+    fn coloring_info(
+        &self,
+        wallet: &Wallet,
+        psbt: &Psbt,
+    ) -> Result<(ContractId, rust_only::ColoringInfo, bool), Error> {
+        let available = swap_input_rgb_amounts(wallet, &self.input_outpoints())?;
+        let change_script = swap_parse_script(self.change_script_hex)?;
+        // RGB change must land on the colored keychain, where the wallet tracks it
+        let colored_change = matches!(
+            wallet.bdk_wallet.derivation_of_spk(change_script.clone()),
+            Some((KeychainKind::External, _))
+        );
+        let change_vout = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .position(|o| colored_change && o.script_pubkey == change_script)
+            .map(|vout| vout as u32);
+        swap_rgb_leg_coloring_info(
+            self.leg,
+            psbt,
+            self.recipient_vout,
+            change_vout,
+            self.blinding,
+            &available,
+        )
+    }
+}
+
+/// Amounts per contract carried by the given wallet inputs.
+fn swap_input_rgb_amounts(
+    wallet: &Wallet,
+    inputs: &HashSet<BdkOutPoint>,
+) -> Result<BTreeMap<ContractId, u64>, Error> {
+    let runtime = wallet.rgb_runtime()?;
+    let mut amounts = BTreeMap::new();
+    for contract_id in runtime.contracts_assigning(inputs.iter().copied())? {
+        let mut total = 0u64;
+        for (_, states) in runtime.contract_assignments_for(contract_id, inputs.iter().copied())? {
+            for (opout, state) in states {
+                if let AllocatedState::Amount(amt) = state
+                    && opout.ty == OS_ASSET
+                {
+                    total = total
+                        .checked_add(amt.as_u64())
+                        .ok_or_else(|| swap_invalid("swap input amounts overflow"))?;
+                }
+            }
+        }
+        amounts.insert(contract_id, total);
+    }
+    Ok(amounts)
 }
 
 fn swap_validate_assignments_for_leg(
@@ -4107,6 +4175,312 @@ impl Wallet {
         Ok((transfer, valid_transfer, assignments))
     }
 
+    async fn swap_select_rgb_inputs(
+        &mut self,
+        online: Online,
+        leg: &OnchainSwapLeg,
+        extra_sat: u64,
+        min_confirmations: u8,
+        excluded: &HashSet<(&str, u32)>,
+    ) -> Result<Vec<OnchainSwapInput>, Error> {
+        let asset_id = leg.asset_id.clone().expect("RGB leg has asset ID");
+        self.database.check_asset_exists(asset_id.clone())?;
+        let assignments = AssignmentsCollection {
+            fungible: leg.amount,
+            non_fungible: false,
+            inflation: 0,
+        };
+        let (_, _, mut input_unspents, _) = self._get_transfer_begin_data(online, 1)?;
+        input_unspents.retain(|u| !excluded.contains(&(u.utxo.txid.as_str(), u.utxo.vout)));
+        let selected = self._select_rgb_inputs(asset_id, &assignments, input_unspents)?;
+        let selected_outpoints = selected
+            .txo_map
+            .into_values()
+            .map(BdkOutPoint::from)
+            .collect::<HashSet<_>>();
+        let swap_inputs = self
+            .bdk_wallet
+            .list_unspent()
+            .filter(|o| selected_outpoints.contains(&o.outpoint))
+            .map(|o| swap_build_input(&o))
+            .collect::<Vec<_>>();
+        if swap_inputs.is_empty() {
+            return Err(swap_invalid("could not resolve selected RGB inputs"));
+        }
+        let total = swap_selected_inputs_total(&swap_inputs);
+        if total < extra_sat {
+            return Err(Error::InsufficientBitcoins {
+                needed: extra_sat,
+                available: total,
+            });
+        }
+        self.swap_ensure_inputs_confirmed(&swap_inputs, min_confirmations)
+            .await?;
+        Ok(swap_inputs)
+    }
+
+    /// Color the RGB leg this wallet sends in a swap, post its consignment to the proxy and record
+    /// it as an `Initiated` batch transfer. The stash is not touched until the swap transaction
+    /// is broadcast ([`Wallet::swap_apply_outgoing`]), so an abandoned swap leaves no trace there.
+    async fn swap_color_outgoing(
+        &mut self,
+        psbt: &mut Psbt,
+        send: &SwapRgbSend<'_>,
+        offer: &OnchainSwapOffer,
+    ) -> Result<Vec<OnchainSwapConsignment>, Error> {
+        let (contract_id, coloring_info, shift) = send.coloring_info(self, psbt)?;
+        let prev_outputs = send.input_outpoints();
+        // what the inputs carry, per outpoint, before the stash changes
+        let mut spent: HashMap<OutPoint, Vec<Assignment>> = HashMap::new();
+        {
+            let runtime = self.rgb_runtime()?;
+            for (explicit_seal, opout_state_map) in
+                runtime.contract_assignments_for(contract_id, prev_outputs.iter().copied())?
+            {
+                for (opout, state) in opout_state_map {
+                    spent
+                        .entry(explicit_seal.to_outpoint())
+                        .or_default()
+                        .push(Assignment::from_opout_and_state(opout, &state));
+                }
+            }
+        }
+        self.color_psbt_stage_for_inputs(psbt, coloring_info.clone(), prev_outputs)?;
+        let fascia = self.color_psbt_finalize(psbt, Some(send.blinding))?;
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        let seal = BuilderSeal::Revealed(GraphSeal::with_blinded_vout(
+            send.recipient_vout,
+            send.blinding,
+        ));
+        let transfer = self.generate_transfer(contract_id, vec![seal], psbt.get_txid(), &fascia)?;
+        let mut consignment_bytes = Vec::new();
+        transfer.save(&mut consignment_bytes)?;
+
+        let proxy_url = offer.proxy_url.as_deref().expect("proxy URL was validated");
+        let endpoint = swap_proxy_transport_endpoint(proxy_url)?;
+        let res = self
+            .wasm_proxy_client
+            .post_consignment(
+                proxy_url,
+                send.recipient_id.to_string(),
+                &consignment_bytes,
+                txid.clone(),
+                Some(send.recipient_vout),
+            )
+            .await?;
+        if let Some(err) = res.error {
+            return Err(if err.message.contains("already used") {
+                Error::RecipientIDAlreadyUsed
+            } else {
+                Error::Proxy {
+                    details: err.message,
+                }
+            });
+        }
+
+        let batch_transfer_idx = self.swap_record_outgoing(
+            psbt,
+            &txid,
+            contract_id,
+            &spent,
+            &coloring_info,
+            shift,
+            offer.expiration_timestamp,
+        )?;
+        self.database.update_swap(&mut DbSwapActMod {
+            swap_id: ActiveValue::Unchanged(offer.swap_id.clone()),
+            outgoing_batch_transfer_idx: ActiveValue::Set(Some(batch_transfer_idx)),
+            outgoing_fascia: ActiveValue::Set(Some(
+                serde_json::to_string(&fascia).map_err(InternalError::from)?,
+            )),
+            updated_at: ActiveValue::Set(now().unix_timestamp()),
+            ..Default::default()
+        })?;
+        Ok(vec![OnchainSwapConsignment {
+            asset_id: contract_id.to_string(),
+            path: String::new(),
+            endpoint: Some(endpoint),
+            txid,
+            vout: send.recipient_vout,
+            blinding: send.blinding,
+            recipient_id: send.recipient_id.to_string(),
+        }])
+    }
+
+    /// Record the RGB leg a swap sends as an `Initiated` batch transfer: the allocations it
+    /// spends, the change it gets back and the recipient it pays.
+    #[allow(clippy::too_many_arguments)]
+    fn swap_record_outgoing(
+        &self,
+        psbt: &Psbt,
+        txid: &str,
+        contract_id: ContractId,
+        spent: &HashMap<OutPoint, Vec<Assignment>>,
+        coloring_info: &rust_only::ColoringInfo,
+        shift_output_map_for_opreturn_first: bool,
+        expiration_timestamp: Option<u64>,
+    ) -> Result<i32, Error> {
+        let batch_transfer_idx = self.database.set_batch_transfer(DbBatchTransferActMod {
+            txid: ActiveValue::Set(Some(txid.to_string())),
+            status: ActiveValue::Set(TransferStatus::Initiated),
+            expiration: ActiveValue::Set(expiration_timestamp.map(|t| t as i64)),
+            created_at: ActiveValue::Set(now().unix_timestamp()),
+            min_confirmations: ActiveValue::Set(1),
+            ..Default::default()
+        })?;
+        let asset_transfer_idx = self.database.set_asset_transfer(DbAssetTransferActMod {
+            user_driven: ActiveValue::Set(true),
+            batch_transfer_idx: ActiveValue::Set(batch_transfer_idx),
+            asset_id: ActiveValue::Set(Some(contract_id.to_string())),
+            ..Default::default()
+        })?;
+        for (outpoint, assignments) in spent {
+            let Some(txo) = self.database.get_txo(&(*outpoint).into())? else {
+                continue;
+            };
+            for assignment in assignments {
+                self.database.set_coloring(DbColoringActMod {
+                    txo_idx: ActiveValue::Set(txo.idx),
+                    asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                    r#type: ActiveValue::Set(ColoringType::Input),
+                    assignment: ActiveValue::Set(assignment.clone()),
+                    ..Default::default()
+                })?;
+            }
+        }
+        let mut external_destinations: Vec<(u32, u64, String)> = vec![];
+        let mut change_destinations: Vec<(u32, u64, String)> = vec![];
+        if let Some(asset_coloring) = coloring_info.asset_info_map.get(&contract_id) {
+            for (mut vout, amount) in BTreeMap::from_iter(asset_coloring.output_map.clone()) {
+                if amount == 0 {
+                    continue;
+                }
+                if shift_output_map_for_opreturn_first {
+                    vout += 1;
+                }
+                let txout = psbt
+                    .unsigned_tx
+                    .output
+                    .get(vout as usize)
+                    .filter(|o| !o.script_pubkey.is_op_return())
+                    .ok_or_else(|| Error::InvalidColoringInfo {
+                        details: s!("invalid vout in output_map, does not exist in the given PSBT"),
+                    })?;
+                let recipient_id = recipient_id_from_script_buf(
+                    txout.script_pubkey.clone(),
+                    self.bitcoin_network(),
+                );
+                if self.bdk_wallet.is_mine(txout.script_pubkey.clone()) {
+                    let outpoint = Outpoint {
+                        txid: txid.to_string(),
+                        vout,
+                    };
+                    let txo_idx = match self.database.get_txo(&outpoint)? {
+                        Some(txo) => txo.idx,
+                        None => self.database.set_txo(DbTxoActMod {
+                            txid: ActiveValue::Set(txid.to_string()),
+                            vout: ActiveValue::Set(vout),
+                            btc_amount: ActiveValue::Set(txout.value.to_sat().to_string()),
+                            spent: ActiveValue::Set(false),
+                            exists: ActiveValue::Set(false),
+                            pending_witness: ActiveValue::Set(false),
+                            ..Default::default()
+                        })?,
+                    };
+                    self.database.set_coloring(DbColoringActMod {
+                        txo_idx: ActiveValue::Set(txo_idx),
+                        asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                        r#type: ActiveValue::Set(ColoringType::Change),
+                        assignment: ActiveValue::Set(Assignment::Fungible(amount)),
+                        ..Default::default()
+                    })?;
+                    change_destinations.push((vout, amount, recipient_id));
+                } else {
+                    external_destinations.push((vout, amount, recipient_id));
+                }
+            }
+        }
+        let destinations = if external_destinations.is_empty() {
+            change_destinations
+        } else {
+            external_destinations
+        };
+        for (vout, amount, recipient_id) in destinations {
+            self.database.set_transfer(DbTransferActMod {
+                asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+                requested_assignment: ActiveValue::Set(Some(Assignment::Fungible(amount))),
+                incoming: ActiveValue::Set(false),
+                recipient_id: ActiveValue::Set(Some(recipient_id)),
+                recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Witness {
+                    vout: Some(vout),
+                })),
+                ..Default::default()
+            })?;
+        }
+        Ok(batch_transfer_idx)
+    }
+
+    /// Consume this wallet's prepared RGB leg of a swap into the stash, once the swap transaction
+    /// is known to the indexer, and mark the inputs it spends.
+    async fn swap_apply_outgoing(
+        &mut self,
+        completion: &OnchainSwapCompletion,
+    ) -> Result<(), Error> {
+        let swap_id = &completion.proposal.request.offer.swap_id;
+        let swap = self
+            .database
+            .get_swap(swap_id)?
+            .ok_or_else(|| swap_invalid(format!("unknown swap {swap_id}")))?;
+        let (Some(batch_transfer_idx), Some(fascia)) =
+            (swap.outgoing_batch_transfer_idx, swap.outgoing_fascia)
+        else {
+            return Ok(());
+        };
+        let batch_transfer = self
+            .database
+            .iter_batch_transfers()?
+            .into_iter()
+            .find(|b| b.idx == batch_transfer_idx)
+            .ok_or_else(|| Error::Inconsistency {
+                details: format!("swap {swap_id} outgoing batch transfer is missing"),
+            })?;
+        if batch_transfer.txid.as_deref() != Some(&completion.txid) {
+            return Err(swap_invalid(
+                "swap txid does not match the prepared RGB leg",
+            ));
+        }
+        if batch_transfer.status != TransferStatus::Initiated {
+            return Ok(());
+        }
+        let fascia: Fascia = serde_json::from_str(&fascia).map_err(InternalError::from)?;
+        self.consume_fascia(fascia, None).await?;
+        let psbt = Psbt::from_str(
+            completion
+                .finalized_psbt
+                .as_deref()
+                .ok_or_else(|| swap_invalid("swap completion is not finalized"))?,
+        )?;
+        let internal: HashSet<(String, u32)> = self
+            .internal_unspents()
+            .map(|u| (u.outpoint.txid.to_string(), u.outpoint.vout))
+            .collect();
+        for input in &psbt.unsigned_tx.input {
+            let outpoint = Outpoint::from(input.previous_output);
+            if internal.contains(&(outpoint.txid.clone(), outpoint.vout)) {
+                continue;
+            }
+            if let Some(txo) = self.database.get_txo(&outpoint)? {
+                let mut spent: DbTxoActMod = txo.into();
+                spent.spent = ActiveValue::Set(true);
+                self.database.update_txo(spent)?;
+            }
+        }
+        let mut updated: DbBatchTransferActMod = batch_transfer.into();
+        updated.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
+        self.database.update_batch_transfer(&mut updated)?;
+        Ok(())
+    }
+
     /// Accept a maker offer as the taker and return the taker's request message.
     ///
     /// The taker validates the offer, selects the BTC inputs it pays with and derives the
@@ -4123,7 +4497,7 @@ impl Wallet {
         exclude_outpoints: Vec<Outpoint>,
     ) -> Result<OnchainSwapRequest, Error> {
         info!(self.logger, "Accepting on-chain swap offer...");
-        self.check_online(online)?;
+        self.check_online(online.clone())?;
         let direction = swap_validate_legs(&offer.maker_gives, &offer.maker_receives)?;
         swap_ensure_supported(direction)?;
         swap_validate_proxy_url(&offer.proxy_url)?;
@@ -4141,35 +4515,74 @@ impl Wallet {
             self.sync_db_txos(false).await?;
         }
         let taker_gives = offer.maker_receives.clone();
-        let needed = taker_gives
-            .amount
-            .checked_add(offer.rgb_output_sat)
-            .and_then(|v| v.checked_add(offer.network_fee_sat))
-            .and_then(|v| v.checked_add(offer.platform_fee_sat))
+        let taker_receives = offer.maker_gives.clone();
+        let fees = offer
+            .network_fee_sat
+            .checked_add(offer.platform_fee_sat)
             .ok_or_else(|| swap_invalid("swap amounts overflow"))?;
         let excluded = exclude_outpoints
             .iter()
             .map(|o| (o.txid.as_str(), o.vout))
             .collect::<HashSet<_>>();
-        let taker_inputs = self
-            .swap_select_btc_inputs(needed, min_confirmations, &excluded)
-            .await?;
-        let script = self
-            ._get_new_address(KeychainKind::External)?
-            .script_pubkey();
-        let taker_rgb_recipient_id =
-            recipient_id_from_script_buf(script.clone(), self.bitcoin_network());
+        let (taker_inputs, change_keychain) = match direction {
+            SwapDirection::RgbForBtc => {
+                let needed = taker_gives
+                    .amount
+                    .checked_add(swap_side_rgb_output_cost(
+                        &taker_receives,
+                        offer.rgb_output_sat,
+                    ))
+                    .and_then(|v| v.checked_add(fees))
+                    .ok_or_else(|| swap_invalid("swap amounts overflow"))?;
+                (
+                    self.swap_select_btc_inputs(needed, min_confirmations, &excluded)
+                        .await?,
+                    KeychainKind::Internal,
+                )
+            }
+            // the RGB inputs carry the sats that pay the fees, and RGB change goes back to the
+            // colored keychain
+            _ => (
+                self.swap_select_rgb_inputs(
+                    online,
+                    &taker_gives,
+                    fees,
+                    min_confirmations,
+                    &excluded,
+                )
+                .await?,
+                KeychainKind::External,
+            ),
+        };
+        let (taker_btc_address, taker_rgb_recipient_id, taker_rgb_script, taker_rgb_blinding) =
+            if matches!(taker_receives.kind, OnchainSwapLegKind::Btc) {
+                let address = self._get_new_address(KeychainKind::Internal)?;
+                (Some(address.to_string()), None, None, None)
+            } else {
+                let script = self
+                    ._get_new_address(KeychainKind::External)?
+                    .script_pubkey();
+                (
+                    None,
+                    Some(recipient_id_from_script_buf(
+                        script.clone(),
+                        self.bitcoin_network(),
+                    )),
+                    Some(script.to_hex_string()),
+                    Some(swap_random_blinding()),
+                )
+            };
         let taker_change_script_pubkey_hex = self
-            ._get_new_address(KeychainKind::Internal)?
+            ._get_new_address(change_keychain)?
             .script_pubkey()
             .to_hex_string();
         let request = OnchainSwapRequest {
             offer,
             taker_inputs,
-            taker_btc_address: None,
-            taker_rgb_recipient_id: Some(taker_rgb_recipient_id),
-            taker_rgb_script_pubkey_hex: Some(script.to_hex_string()),
-            taker_rgb_blinding: Some(swap_random_blinding()),
+            taker_btc_address,
+            taker_rgb_recipient_id,
+            taker_rgb_script_pubkey_hex: taker_rgb_script,
+            taker_rgb_blinding,
             taker_change_script_pubkey_hex,
         };
         let created_at = now().unix_timestamp();
@@ -4227,7 +4640,7 @@ impl Wallet {
         if proposal.txid != psbt.unsigned_tx.compute_txid().to_string() {
             return Err(swap_invalid("swap proposal txid mismatch"));
         }
-        let (_expected_psbt, _maker_rgb_vout, taker_rgb_vout) = swap_build_psbt(&proposal)?;
+        let (_expected_psbt, maker_rgb_vout, taker_rgb_vout) = swap_build_psbt(&proposal)?;
         let all_inputs = proposal
             .maker_inputs
             .iter()
@@ -4236,44 +4649,67 @@ impl Wallet {
             .collect::<Vec<_>>();
         swap_restore_input_metadata(&mut psbt, &all_inputs)?;
 
-        let vout = taker_rgb_vout.ok_or_else(|| swap_invalid("missing taker RGB vout"))?;
-        let blinding = proposal
-            .request
-            .taker_rgb_blinding
-            .ok_or_else(|| swap_invalid("missing taker RGB blinding"))?;
-        let recipient_id = proposal
-            .request
-            .taker_rgb_recipient_id
-            .as_deref()
-            .ok_or_else(|| swap_invalid("missing taker RGB recipient ID"))?;
-        let asset_id = offer
-            .maker_gives
-            .asset_id
-            .as_deref()
-            .expect("RGB leg has asset ID");
-        let matching = proposal
-            .consignments
-            .iter()
-            .filter(|c| c.asset_id == asset_id)
-            .collect::<Vec<_>>();
-        if matching.len() != 1 {
-            return Err(swap_invalid(format!(
-                "expected exactly one RGB swap consignment for {asset_id}, got {}",
-                matching.len()
-            )));
+        let mut consignments = proposal.consignments.clone();
+        match direction {
+            SwapDirection::RgbForBtc => {
+                let vout = taker_rgb_vout.ok_or_else(|| swap_invalid("missing taker RGB vout"))?;
+                let blinding = proposal
+                    .request
+                    .taker_rgb_blinding
+                    .ok_or_else(|| swap_invalid("missing taker RGB blinding"))?;
+                let recipient_id = proposal
+                    .request
+                    .taker_rgb_recipient_id
+                    .as_deref()
+                    .ok_or_else(|| swap_invalid("missing taker RGB recipient ID"))?;
+                let asset_id = offer
+                    .maker_gives
+                    .asset_id
+                    .as_deref()
+                    .expect("RGB leg has asset ID");
+                let matching = proposal
+                    .consignments
+                    .iter()
+                    .filter(|c| c.asset_id == asset_id)
+                    .collect::<Vec<_>>();
+                if matching.len() != 1 {
+                    return Err(swap_invalid(format!(
+                        "expected exactly one RGB swap consignment for {asset_id}, got {}",
+                        matching.len()
+                    )));
+                }
+                let consignment = matching[0];
+                if consignment.txid != proposal.txid
+                    || consignment.vout != vout
+                    || consignment.blinding != blinding
+                    || consignment.recipient_id != recipient_id
+                {
+                    return Err(swap_invalid(
+                        "RGB swap consignment does not match the swap output",
+                    ));
+                }
+                self.swap_fetch_received_transfer(consignment, &offer.maker_gives, blinding)
+                    .await?;
+            }
+            _ => {
+                let send = SwapRgbSend {
+                    leg: &offer.maker_receives,
+                    inputs: &proposal.request.taker_inputs,
+                    change_script_hex: &proposal.request.taker_change_script_pubkey_hex,
+                    recipient_id: offer
+                        .maker_rgb_recipient_id
+                        .as_deref()
+                        .ok_or_else(|| swap_invalid("missing maker RGB recipient ID"))?,
+                    recipient_vout: maker_rgb_vout
+                        .ok_or_else(|| swap_invalid("missing maker RGB vout"))?,
+                    blinding: offer
+                        .maker_rgb_blinding
+                        .ok_or_else(|| swap_invalid("missing maker RGB blinding"))?,
+                };
+                consignments.extend(self.swap_color_outgoing(&mut psbt, &send, offer).await?);
+                swap_restore_input_metadata(&mut psbt, &all_inputs)?;
+            }
         }
-        let consignment = matching[0];
-        if consignment.txid != proposal.txid
-            || consignment.vout != vout
-            || consignment.blinding != blinding
-            || consignment.recipient_id != recipient_id
-        {
-            return Err(swap_invalid(
-                "RGB swap consignment does not match the swap output",
-            ));
-        }
-        self.swap_fetch_received_transfer(consignment, &offer.maker_gives, blinding)
-            .await?;
 
         if !skip_sync {
             self.sync_db_txos(false).await?;
@@ -4290,7 +4726,6 @@ impl Wallet {
             }),
         )?;
         let txid = psbt.unsigned_tx.compute_txid().to_string();
-        let consignments = proposal.consignments.clone();
         let completion = OnchainSwapCompletion {
             psbt: psbt.to_string(),
             finalized_psbt: None,
@@ -4393,11 +4828,26 @@ impl Wallet {
         Ok(())
     }
 
-    /// Accept the RGB transfer received from a completed on-chain swap.
+    fn swap_mark_accepted(&self, completion: &OnchainSwapCompletion) -> Result<(), Error> {
+        self.database.update_swap(&mut DbSwapActMod {
+            swap_id: ActiveValue::Unchanged(completion.proposal.request.offer.swap_id.clone()),
+            stage: ActiveValue::Set(OnchainSwapStage::Accepted),
+            txid: ActiveValue::Set(Some(completion.txid.clone())),
+            completion: ActiveValue::Set(Some(
+                serde_json::to_string(completion).map_err(InternalError::from)?,
+            )),
+            updated_at: ActiveValue::Set(now().unix_timestamp()),
+            ..Default::default()
+        })?;
+        Ok(())
+    }
+
+    /// Settle a completed on-chain swap as the taker.
     ///
-    /// Call it as the taker once the maker has broadcast the swap transaction. The consignment
-    /// the maker posted is validated and accepted into the wallet's RGB state. Returns the
-    /// [`Assignment`]s received.
+    /// Call it once the maker has broadcast the swap transaction. When the taker receives RGB, the
+    /// consignment the maker posted is validated and accepted into the wallet's RGB state and the
+    /// [`Assignment`]s received are returned. When the taker sends RGB, its prepared RGB leg is
+    /// consumed into the stash and the result is empty.
     pub async fn accept_swap_transfers(
         &mut self,
         online: Online,
@@ -4418,6 +4868,19 @@ impl Wallet {
             self.swap_load(&offer.swap_id, |s| s.request.as_ref(), "request")?;
         swap_ensure_state_matches(&local_request, &completion.proposal.request, "request")?;
         self.swap_apply_witness_tx(&completion).await?;
+        if direction == SwapDirection::BtcForRgb {
+            self.swap_apply_outgoing(&completion).await?;
+            if !skip_sync {
+                self.sync_db_txos(false).await?;
+            }
+            self.swap_mark_accepted(&completion)?;
+            self.update_backup_info(false)?;
+            self.flush().await?;
+            info!(self.logger, "Accept swap transfers completed");
+            return Ok(OnchainSwapReceiveResult {
+                assignments: vec![],
+            });
+        }
         if !skip_sync {
             self.sync_db_txos(false).await?;
         }
@@ -4490,16 +4953,7 @@ impl Wallet {
             offer.rgb_output_sat,
             &assignments,
         )?;
-        self.database.update_swap(&mut DbSwapActMod {
-            swap_id: ActiveValue::Unchanged(offer.swap_id.clone()),
-            stage: ActiveValue::Set(OnchainSwapStage::Accepted),
-            txid: ActiveValue::Set(Some(completion.txid.clone())),
-            completion: ActiveValue::Set(Some(
-                serde_json::to_string(&completion).map_err(InternalError::from)?,
-            )),
-            updated_at: ActiveValue::Set(now().unix_timestamp()),
-            ..Default::default()
-        })?;
+        self.swap_mark_accepted(&completion)?;
         self.update_backup_info(false)?;
         self.flush().await?;
         info!(self.logger, "Accept swap transfers completed");
@@ -4528,6 +4982,19 @@ impl Wallet {
             && self.indexer().get_tx_confirmations(txid).await?.is_some()
         {
             return Err(Error::CannotFailBatchTransfer);
+        }
+        // release the inputs the prepared RGB leg reserved
+        if let Some(idx) = swap.outgoing_batch_transfer_idx
+            && let Some(batch_transfer) = self
+                .database
+                .iter_batch_transfers()?
+                .into_iter()
+                .find(|b| b.idx == idx)
+            && batch_transfer.status == TransferStatus::Initiated
+        {
+            let mut failed: DbBatchTransferActMod = batch_transfer.into();
+            failed.status = ActiveValue::Set(TransferStatus::Failed);
+            self.database.update_batch_transfer(&mut failed)?;
         }
         self.database.update_swap(&mut DbSwapActMod {
             swap_id: ActiveValue::Unchanged(swap_id),

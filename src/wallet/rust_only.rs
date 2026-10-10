@@ -354,6 +354,41 @@ impl Wallet {
         Ok(())
     }
 
+    /// Produce an [`RgbTransfer`] consignment for a single contract given its beneficiaries
+    /// (typically obtained from a prior [`Wallet::color_psbt_stage`] call) and the witness
+    /// transaction ID of the PSBT being colored, built from the colored PSBT's `fascia`.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn generate_transfer(
+        &self,
+        contract_id: ContractId,
+        beneficiaries: Vec<BuilderSeal<GraphSeal>>,
+        witness_txid: RgbTxid,
+        fascia: &Fascia,
+    ) -> Result<RgbTransfer, Error> {
+        let runtime = self.rgb_runtime()?;
+        let mut beneficiaries_witness = vec![];
+        let mut beneficiaries_blinded = vec![];
+        for builder_seal in beneficiaries {
+            match builder_seal {
+                BuilderSeal::Revealed(seal) => {
+                    let explicit_seal = ExplicitSeal::with(witness_txid, seal.vout);
+                    beneficiaries_witness.push(explicit_seal);
+                }
+                BuilderSeal::Concealed(secret_seal) => {
+                    beneficiaries_blinded.push(secret_seal);
+                }
+            };
+        }
+        Ok(runtime.transfer_from_fascia(
+            contract_id,
+            beneficiaries_witness,
+            beneficiaries_blinded,
+            fascia,
+        )?)
+    }
+
     /// Color a PSBT, consume the RGB fascia and return the related consignment.
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
