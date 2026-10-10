@@ -8,7 +8,10 @@ use std::panic;
 use wasm_bindgen::prelude::*;
 
 use rgb_lib_wasm::Wallet;
-use rgb_lib_wasm::wallet::{Online, Recipient, RefreshFilter, WalletData};
+use rgb_lib_wasm::wallet::{
+    OnchainSwapCompletion, OnchainSwapOffer, OnchainSwapProposal, OnchainSwapRole, Online,
+    Outpoint, Recipient, RefreshFilter, WalletData,
+};
 
 /// Serialize to JsValue using BigInt for u64/i64 values that exceed Number.MAX_SAFE_INTEGER.
 fn to_js<T: Serialize>(val: &T) -> Result<JsValue, JsValue> {
@@ -795,6 +798,112 @@ impl WasmWallet {
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&info)
+    }
+
+    /// Accept a swap offer as the taker (the maker gives RGB, the taker pays BTC). Returns the
+    /// OnchainSwapRequest to send to the maker.
+    #[wasm_bindgen(js_name = "acceptSwapOffer")]
+    pub async fn accept_swap_offer(
+        &self,
+        online_js: JsValue,
+        offer_js: JsValue,
+        min_confirmations: u8,
+        skip_sync: bool,
+        exclude_outpoints_js: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let offer: OnchainSwapOffer = serde_wasm_bindgen::from_value(offer_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid swap offer: {e}")))?;
+        let exclude_outpoints: Vec<Outpoint> = if exclude_outpoints_js.is_undefined() {
+            vec![]
+        } else {
+            serde_wasm_bindgen::from_value(exclude_outpoints_js)
+                .map_err(|e| JsValue::from_str(&format!("Invalid outpoints: {e}")))?
+        };
+        let mut wallet = self.inner.borrow_mut();
+        let request = wallet
+            .accept_swap_offer(
+                online,
+                offer,
+                min_confirmations,
+                skip_sync,
+                exclude_outpoints,
+            )
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&request)
+    }
+
+    /// Complete a maker proposal as the taker. Returns the OnchainSwapCompletion to send to the
+    /// maker, who signs last and broadcasts.
+    #[wasm_bindgen(js_name = "completeSwapProposal")]
+    pub async fn complete_swap_proposal(
+        &self,
+        online_js: JsValue,
+        proposal_js: JsValue,
+        min_confirmations: u8,
+        skip_sync: bool,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let proposal: OnchainSwapProposal = serde_wasm_bindgen::from_value(proposal_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid swap proposal: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let completion = wallet
+            .complete_swap_proposal(online, proposal, min_confirmations, skip_sync)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&completion)
+    }
+
+    /// Accept the RGB transfer received from a swap the maker has broadcast. `role` is "Taker".
+    #[wasm_bindgen(js_name = "acceptSwapTransfers")]
+    pub async fn accept_swap_transfers(
+        &self,
+        online_js: JsValue,
+        completion_js: JsValue,
+        role: &str,
+        skip_sync: bool,
+    ) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let completion: OnchainSwapCompletion = serde_wasm_bindgen::from_value(completion_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid swap completion: {e}")))?;
+        let role = match role {
+            "Maker" => OnchainSwapRole::Maker,
+            "Taker" => OnchainSwapRole::Taker,
+            other => return Err(JsValue::from_str(&format!("Invalid swap role: {other}"))),
+        };
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .accept_swap_transfers(online, completion, role, skip_sync)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&result)
+    }
+
+    /// Cancel a swap whose transaction has not been broadcast.
+    #[wasm_bindgen(js_name = "cancelSwap")]
+    pub async fn cancel_swap(&self, online_js: JsValue, swap_id: String) -> Result<(), JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        wallet
+            .cancel_swap(online, swap_id)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// List the swaps this wallet has state for, including cancelled ones.
+    #[wasm_bindgen(js_name = "listSwaps")]
+    pub fn list_swaps(&self) -> Result<JsValue, JsValue> {
+        let swaps = self
+            .inner
+            .borrow()
+            .list_swaps()
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&swaps)
     }
 }
 
