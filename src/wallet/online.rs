@@ -4745,6 +4745,7 @@ impl Wallet {
             .await?;
         self.swap_ensure_inputs_confirmed(&proposal.request.taker_inputs, min_confirmations)
             .await?;
+        let before_signing = psbt.clone();
         self._sign_psbt(
             &mut psbt,
             Some(SignOptions {
@@ -4752,7 +4753,7 @@ impl Wallet {
                 ..Default::default()
             }),
         )?;
-        swap_ensure_only_own_inputs_signed(&psbt, &proposal.request.taker_inputs)?;
+        swap_ensure_only_own_inputs_signed(&before_signing, &psbt, &proposal.request.taker_inputs)?;
         let txid = psbt.unsigned_tx.compute_txid().to_string();
         let completion = OnchainSwapCompletion {
             psbt: psbt.to_string(),
