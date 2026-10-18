@@ -1217,6 +1217,14 @@ impl WasmInvoice {
     }
 }
 
+/// The output script (hex) a witness `recipientId` pays to, or `null` for a blinded one.
+#[wasm_bindgen(js_name = "scriptBufFromRecipientId")]
+pub fn script_buf_from_recipient_id(recipient_id: &str) -> Result<Option<String>, JsValue> {
+    rgb_lib_wasm::utils::script_buf_from_recipient_id(recipient_id.to_string())
+        .map(|script| script.map(|s| s.to_hex_string()))
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
 /// Check whether the provided URL points to a valid RGB proxy server.
 #[wasm_bindgen(js_name = "checkProxyUrl")]
 pub async fn check_proxy_url(proxy_url: &str) -> Result<(), JsValue> {
