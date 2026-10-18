@@ -398,6 +398,19 @@ pub(crate) fn beneficiary_from_script_buf(script_buf: ScriptBuf) -> Beneficiary 
     Beneficiary::WitnessVout(Pay2Vout::new(address_payload), None)
 }
 
+/// Return the recipient ID for a script buf, or an error if it is not a standard address payload
+pub(crate) fn try_recipient_id_from_script_buf(
+    script_buf: &ScriptBuf,
+    bitcoin_network: BitcoinNetwork,
+) -> Result<String, Error> {
+    let address_payload =
+        AddressPayload::from_script(script_buf).map_err(|e| Error::InvalidAddress {
+            details: e.to_string(),
+        })?;
+    let beneficiary = Beneficiary::WitnessVout(Pay2Vout::new(address_payload), None);
+    Ok(XChainNet::with(bitcoin_network.into(), beneficiary).to_string())
+}
+
 /// Return the recipient ID for a specific script buf
 pub fn recipient_id_from_script_buf(
     script_buf: ScriptBuf,
