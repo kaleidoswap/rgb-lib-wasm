@@ -5,13 +5,18 @@ use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::panic;
+use std::str::FromStr;
 use wasm_bindgen::prelude::*;
 
-use rgb_lib_wasm::Wallet;
+use rgb_lib_wasm::bitcoin::{OutPoint, psbt::Psbt};
+use rgb_lib_wasm::wallet::rust_only::{
+    AssetColoringInfo, ColoringInfo, ExpectedTransfer, PsbtOpExpiry,
+};
 use rgb_lib_wasm::wallet::{
     OnchainSwapCompletion, OnchainSwapOffer, OnchainSwapProposal, OnchainSwapRole, Online,
     Outpoint, Recipient, RefreshFilter, WalletData,
 };
+use rgb_lib_wasm::{Assignment, ContractId, FileContent, RgbTransfer, Wallet};
 
 /// Serialize to JsValue using BigInt for u64/i64 values that exceed Number.MAX_SAFE_INTEGER.
 fn to_js<T: Serialize>(val: &T) -> Result<JsValue, JsValue> {
@@ -19,6 +24,80 @@ fn to_js<T: Serialize>(val: &T) -> Result<JsValue, JsValue> {
         serde_wasm_bindgen::Serializer::new().serialize_large_number_types_as_bigints(true);
     val.serialize(&serializer)
         .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+fn js_err(e: impl std::fmt::Display) -> JsValue {
+    JsValue::from_str(&e.to_string())
+}
+
+fn online_from_js(online_js: JsValue) -> Result<Online, JsValue> {
+    serde_wasm_bindgen::from_value(online_js)
+        .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))
+}
+
+/// A u64 given as a decimal string, a BigInt or a safe-integer Number.
+fn u64_from_js(value: JsValue, what: &str) -> Result<u64, JsValue> {
+    let parsed = match value.as_string() {
+        Some(s) => s.parse().ok(),
+        None => serde_wasm_bindgen::from_value(value).ok(),
+    };
+    parsed.ok_or_else(|| JsValue::from_str(&format!("Invalid {what}")))
+}
+
+/// JS shape of [`AssetColoringInfo`]: `outputMap` maps a vout (object key) to an amount.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsAssetColoringInfo {
+    output_map: HashMap<String, u64>,
+    static_blinding: Option<u64>,
+}
+
+/// JS shape of [`ColoringInfo`]: `assetInfoMap` maps an asset ID to its coloring.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsColoringInfo {
+    asset_info_map: HashMap<String, JsAssetColoringInfo>,
+    static_blinding: Option<u64>,
+    nonce: Option<u64>,
+}
+
+impl TryFrom<JsColoringInfo> for ColoringInfo {
+    type Error = JsValue;
+
+    fn try_from(info: JsColoringInfo) -> Result<Self, JsValue> {
+        let mut asset_info_map = HashMap::new();
+        for (asset_id, asset_info) in info.asset_info_map {
+            let contract_id = ContractId::from_str(&asset_id)
+                .map_err(|_| JsValue::from_str(&format!("Invalid asset ID: {asset_id}")))?;
+            let mut output_map = HashMap::new();
+            for (vout, amount) in asset_info.output_map {
+                let vout: u32 = vout
+                    .parse()
+                    .map_err(|_| JsValue::from_str(&format!("Invalid vout: {vout}")))?;
+                output_map.insert(vout, amount);
+            }
+            asset_info_map.insert(
+                contract_id,
+                AssetColoringInfo {
+                    output_map,
+                    static_blinding: asset_info.static_blinding,
+                },
+            );
+        }
+        Ok(ColoringInfo {
+            asset_info_map,
+            static_blinding: info.static_blinding,
+            nonce: info.nonce,
+        })
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsAcceptedTransfer {
+    /// Strict-encoded consignment, hex
+    consignment: String,
+    assignments: Vec<Assignment>,
 }
 
 #[wasm_bindgen(js_namespace = console)]
@@ -904,6 +983,208 @@ impl WasmWallet {
             .list_swaps()
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         to_js(&swaps)
+    }
+}
+
+#[wasm_bindgen]
+impl WasmWallet {
+    /// Fetch the consignment posted under `proxyRecipientId`, pin its witness output to
+    /// `witnessRecipientId` with at least `minConfirmations` and accept it if it matches
+    /// `expected` (`{ assetId, assetSchema: "Nia", assignment: { Fungible: n } }`).
+    /// `blinding` is a decimal string, a BigInt or a safe Number. Returns
+    /// `{ consignment: <hex>, assignments }`. Rejects with "Insufficient confirmations: ..."
+    /// while the lock is too shallow.
+    #[wasm_bindgen(js_name = "fetchAndAcceptTransferByRecipientId")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_and_accept_transfer_by_recipient_id(
+        &self,
+        online_js: JsValue,
+        proxy_recipient_id: String,
+        witness_recipient_id: String,
+        consignment_endpoint: String,
+        blinding_js: JsValue,
+        min_confirmations: u8,
+        expected_js: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let online = online_from_js(online_js)?;
+        let blinding = u64_from_js(blinding_js, "blinding")?;
+        let expected: ExpectedTransfer = serde_wasm_bindgen::from_value(expected_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid expected transfer: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let (consignment, assignments) = wallet
+            .fetch_and_accept_transfer_by_recipient_id(
+                online,
+                proxy_recipient_id,
+                witness_recipient_id,
+                &consignment_endpoint,
+                blinding,
+                min_confirmations,
+                expected,
+            )
+            .await
+            .map_err(js_err)?;
+        let mut bytes = vec![];
+        consignment.save(&mut bytes).map_err(js_err)?;
+        to_js(&JsAcceptedTransfer {
+            consignment: hex::encode(bytes),
+            assignments,
+        })
+    }
+
+    /// Register the asset of an accepted consignment (hex, as returned by
+    /// `fetchAndAcceptTransferByRecipientId`) whose witness transaction is `txid`.
+    #[wasm_bindgen(js_name = "saveNewAsset")]
+    pub async fn save_new_asset(
+        &self,
+        online_js: JsValue,
+        consignment_hex: String,
+        txid: String,
+    ) -> Result<(), JsValue> {
+        let online = online_from_js(online_js)?;
+        let bytes = hex::decode(&consignment_hex)
+            .map_err(|_| JsValue::from_str("Invalid consignment hex"))?;
+        let consignment = RgbTransfer::load(&bytes[..])
+            .map_err(|e| JsValue::from_str(&format!("Invalid consignment: {e}")))?;
+        let wallet = self.inner.borrow();
+        wallet
+            .save_new_asset(online, consignment, txid)
+            .await
+            .map_err(js_err)
+    }
+
+    /// Color an externally built PSBT (base64) spending `inputOutpoints` (`[{ txid, vout }]`,
+    /// possibly not this wallet's, e.g. an HTLC) and store the operation. `outputMap` keys in
+    /// `coloringInfo` are final vouts: the PSBT must already carry its OP_RETURN (first next to
+    /// a P2TR output). `expiry` is `"default"` (also when omitted), `"never"` or `{ at: <unix> }`.
+    /// Returns `{ operationId, coloredPsbt, allocations }`.
+    #[wasm_bindgen(js_name = "psbtOpPrepare")]
+    pub async fn psbt_op_prepare(
+        &self,
+        psbt: String,
+        coloring_info_js: JsValue,
+        input_outpoints_js: JsValue,
+        min_confirmations: u8,
+        expiry_js: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let mut psbt = Psbt::from_str(&psbt).map_err(js_err)?;
+        let coloring_info: JsColoringInfo = serde_wasm_bindgen::from_value(coloring_info_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid coloring info: {e}")))?;
+        let input_outpoints: Vec<Outpoint> = serde_wasm_bindgen::from_value(input_outpoints_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid outpoints: {e}")))?;
+        let input_outpoints = input_outpoints
+            .into_iter()
+            .map(|o| OutPoint::from_str(&o.to_string()).map_err(js_err))
+            .collect::<Result<Vec<_>, _>>()?;
+        let expiry: PsbtOpExpiry = if expiry_js.is_undefined() || expiry_js.is_null() {
+            PsbtOpExpiry::Default
+        } else {
+            serde_wasm_bindgen::from_value(expiry_js)
+                .map_err(|e| JsValue::from_str(&format!("Invalid expiry: {e}")))?
+        };
+        let wallet = self.inner.borrow();
+        let result = wallet
+            .psbt_op_prepare_with_expiry(
+                &mut psbt,
+                coloring_info.try_into()?,
+                input_outpoints,
+                min_confirmations,
+                expiry,
+            )
+            .await
+            .map_err(js_err)?;
+        to_js(&result)
+    }
+
+    /// Record that the operation's transaction is about to be broadcast. Await it before
+    /// broadcasting.
+    #[wasm_bindgen(js_name = "psbtOpMarkBroadcast")]
+    pub async fn psbt_op_mark_broadcast(&self, operation_id: String) -> Result<(), JsValue> {
+        let wallet = self.inner.borrow();
+        wallet
+            .psbt_op_mark_broadcast(&operation_id)
+            .await
+            .map_err(js_err)
+    }
+
+    /// Consume a prepared operation into the RGB stash once the indexer sees its transaction.
+    #[wasm_bindgen(js_name = "psbtOpApply")]
+    pub async fn psbt_op_apply(
+        &self,
+        online_js: JsValue,
+        operation_id: String,
+    ) -> Result<(), JsValue> {
+        let online = online_from_js(online_js)?;
+        let mut wallet = self.inner.borrow_mut();
+        wallet
+            .psbt_op_apply(online, &operation_id)
+            .await
+            .map_err(js_err)
+    }
+
+    /// Abort a prepared operation whose transaction never reached the network.
+    #[wasm_bindgen(js_name = "psbtOpAbort")]
+    pub async fn psbt_op_abort(
+        &self,
+        online_js: JsValue,
+        operation_id: String,
+    ) -> Result<(), JsValue> {
+        let online = online_from_js(online_js)?;
+        let mut wallet = self.inner.borrow_mut();
+        wallet
+            .psbt_op_abort(online, &operation_id)
+            .await
+            .map_err(js_err)
+    }
+
+    /// Find a stored operation by its transaction ID. Returns
+    /// `{ operationId, coloredPsbt, status, broadcast, txid, allocations }`.
+    #[wasm_bindgen(js_name = "psbtOpByTxid")]
+    pub fn psbt_op_by_txid(&self, txid: String) -> Result<JsValue, JsValue> {
+        let op = self.inner.borrow().psbt_op_by_txid(&txid).map_err(js_err)?;
+        to_js(&op)
+    }
+
+    /// List the stored operations spending `outpoint` (`{ txid, vout }`), oldest first.
+    #[wasm_bindgen(js_name = "psbtOpsSpending")]
+    pub fn psbt_ops_spending(&self, outpoint_js: JsValue) -> Result<JsValue, JsValue> {
+        let outpoint: Outpoint = serde_wasm_bindgen::from_value(outpoint_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid outpoint: {e}")))?;
+        let ops = self
+            .inner
+            .borrow()
+            .psbt_ops_spending(outpoint)
+            .map_err(js_err)?;
+        to_js(&ops)
+    }
+
+    /// Hand an applied operation's consignment for `assetId` to the pending receive it pays.
+    /// Returns the refresh result of the receives it settled.
+    #[wasm_bindgen(js_name = "psbtOpProvideReceiveConsignment")]
+    pub async fn psbt_op_provide_receive_consignment(
+        &self,
+        online_js: JsValue,
+        operation_id: String,
+        asset_id: String,
+    ) -> Result<JsValue, JsValue> {
+        let online = online_from_js(online_js)?;
+        let mut wallet = self.inner.borrow_mut();
+        let result = wallet
+            .psbt_op_provide_receive_consignment(online, &operation_id, &asset_id)
+            .await
+            .map_err(js_err)?;
+        to_js(&result)
+    }
+
+    /// Reconcile an operation with its batch transfer and return its status
+    /// (`"prepared"`, `"applied"`, `"failed"` or `"settled"`).
+    #[wasm_bindgen(js_name = "psbtOpReconcile")]
+    pub fn psbt_op_reconcile(&self, operation_id: String) -> Result<JsValue, JsValue> {
+        let status = self
+            .inner
+            .borrow()
+            .psbt_op_reconcile(&operation_id)
+            .map_err(js_err)?;
+        to_js(&status)
     }
 }
 
