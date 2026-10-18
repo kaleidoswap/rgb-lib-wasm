@@ -3155,7 +3155,10 @@ impl Wallet {
         use crate::database::memory_db::{ActiveValue, DbBackupInfoActMod};
 
         let now_str = {
+            #[cfg(target_arch = "wasm32")]
             let ms = js_sys::Date::now() as i64;
+            #[cfg(not(target_arch = "wasm32"))]
+            let ms = (now().unix_timestamp_nanos() / 1_000_000) as i64;
             let secs = ms / 1000;
             let nanos = ((ms % 1000) * 1_000_000) as u32;
             let dt = time::OffsetDateTime::from_unix_timestamp(secs)
@@ -3209,6 +3212,7 @@ impl Wallet {
 
     /// Trigger an async save of wallet state to IndexedDB.
     pub(crate) fn trigger_auto_backup(&self) {
+        #[cfg(target_arch = "wasm32")]
         self.save_to_idb();
     }
 
@@ -3256,6 +3260,7 @@ impl Wallet {
     }
 
     /// Save current wallet state to IndexedDB asynchronously via spawn_local.
+    #[cfg(target_arch = "wasm32")]
     fn save_to_idb(&self) {
         use std::sync::atomic::Ordering;
 
