@@ -2719,6 +2719,27 @@ impl Wallet {
                     }
                 }
             }
+        } else {
+            // on-chain swap receives are recorded on non-incoming batches
+            let asset_transfer_idxs = batch_transfer
+                .get_asset_transfers(&db_data.asset_transfers)?
+                .iter()
+                .map(|t| t.idx)
+                .collect::<HashSet<_>>();
+            for coloring in db_data.colorings.iter().filter(|c| {
+                c.r#type == ColoringType::Receive
+                    && asset_transfer_idxs.contains(&c.asset_transfer_idx)
+            }) {
+                if let Some(txo) = db_data
+                    .txos
+                    .iter()
+                    .find(|t| t.idx == coloring.txo_idx && t.pending_witness)
+                {
+                    let mut txo: DbTxoActMod = txo.clone().into();
+                    txo.pending_witness = ActiveValue::Set(false);
+                    self.database.update_txo(txo)?;
+                }
+            }
         }
 
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();

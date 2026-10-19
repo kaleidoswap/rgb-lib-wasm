@@ -9,6 +9,8 @@
 //!   wasm-pack test --headless --firefox --release --features camel_case -- --test swap_wasm
 //! ```
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use wasm_bindgen_test::*;
@@ -20,9 +22,9 @@ mod utils;
 use rgb_lib_wasm::wallet::DatabaseType;
 use rgb_lib_wasm::wallet::{
     OnchainSwapCompletion, OnchainSwapOffer, OnchainSwapProposal, OnchainSwapRole,
-    OnchainSwapStage, Wallet, WalletData,
+    OnchainSwapStage, Recipient, Wallet, WalletData, WitnessData,
 };
-use rgb_lib_wasm::{AssetSchema, BitcoinNetwork, generate_keys};
+use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, TransferStatus, generate_keys};
 use utils::*;
 
 const SIM_URL: &str = match option_env!("RGB_TEST_SWAP_SIM_URL") {
@@ -306,6 +308,156 @@ async fn test_taker_buys_rgb_from_a_native_maker() {
     let swaps = wallet.list_swaps().unwrap();
     assert_eq!(swaps.len(), 1);
     assert_eq!(swaps[0].stage, OnchainSwapStage::Accepted);
+}
+
+#[wasm_bindgen_test]
+async fn test_taker_spends_an_asset_it_bought() {
+    let (mut wallet, online, asset_id) = setup().await;
+    let offer = make_offer(&asset_id, 3600).await;
+    let request = wallet
+        .accept_swap_offer(online.clone(), offer, 0, false, vec![])
+        .await
+        .unwrap();
+    let proposal: OnchainSwapProposal = sim_post("/request", &json!({ "request": request })).await;
+    let completion = wallet
+        .complete_swap_proposal(online.clone(), proposal, 0, false)
+        .await
+        .unwrap();
+    let done: OnchainSwapCompletion =
+        sim_post("/completion", &json!({ "completion": completion })).await;
+    wait_for_esplora_sync().await;
+    wallet
+        .accept_swap_transfers(online.clone(), done, OnchainSwapRole::Taker, false)
+        .await
+        .unwrap();
+    // before confirmation the bought output is not spendable yet
+    assert_eq!(
+        wallet
+            .get_asset_balance(asset_id.clone())
+            .unwrap()
+            .spendable,
+        0
+    );
+
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    // the indexer can see the new tip a moment before the transaction in it
+    let mut settled = false;
+    for _ in 0..20 {
+        let refreshed = wallet
+            .refresh(online.clone(), None, vec![], false)
+            .await
+            .unwrap();
+        assert!(
+            refreshed.values().all(|r| r.failure.is_none()),
+            "{refreshed:?}"
+        );
+        if refreshed
+            .values()
+            .any(|r| r.updated_status == Some(TransferStatus::Settled))
+        {
+            settled = true;
+            break;
+        }
+        sleep_ms(500).await;
+    }
+    assert!(settled, "the swap receive never settled");
+    let balance = wallet.get_asset_balance(asset_id.clone()).unwrap();
+    assert_eq!(
+        (balance.settled, balance.spendable),
+        (ASSET_AMOUNT, ASSET_AMOUNT)
+    );
+
+    // the bought asset leaves in an ordinary RGB send, funded by another colored UTXO
+    let unsigned = wallet
+        .create_utxos_begin(online.clone(), false, Some(1), Some(10_000), 1, true)
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    wallet
+        .create_utxos_end(online.clone(), signed, true)
+        .await
+        .unwrap();
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    wallet.sync(online.clone()).await.unwrap();
+    let mut receiver = Wallet::new(test_wallet_data()).unwrap();
+    let receiver_online = receiver
+        .go_online(false, ESPLORA_URL.to_string())
+        .await
+        .unwrap();
+    let transport = format!("rpc://{}", PROXY_URL.trim_start_matches("http://"));
+    let receive = receiver
+        .witness_receive(
+            None,
+            Assignment::Fungible(ASSET_AMOUNT),
+            None,
+            vec![transport.clone()],
+            1,
+        )
+        .unwrap();
+    let recipient = Recipient {
+        recipient_id: receive.recipient_id,
+        witness_data: Some(WitnessData {
+            amount_sat: 2_000,
+            blinding: None,
+        }),
+        assignment: Assignment::Fungible(ASSET_AMOUNT),
+        transport_endpoints: vec![transport],
+    };
+    let unsigned = wallet
+        .send_begin(
+            online.clone(),
+            HashMap::from([(asset_id.clone(), vec![recipient])]),
+            true,
+            1,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+    let signed = wallet.sign_psbt(unsigned, None).unwrap();
+    wallet
+        .send_end(online.clone(), signed, false)
+        .await
+        .unwrap();
+
+    mine_blocks(1).await;
+    wait_for_esplora_sync().await;
+    receiver.sync(receiver_online.clone()).await.unwrap();
+    for _ in 0..20 {
+        let refreshed = receiver
+            .refresh(receiver_online.clone(), None, vec![], false)
+            .await
+            .unwrap();
+        assert!(
+            refreshed.values().all(|r| r.failure.is_none()),
+            "{refreshed:?}"
+        );
+        if receiver
+            .get_asset_balance(asset_id.clone())
+            .unwrap()
+            .settled
+            > 0
+        {
+            break;
+        }
+        sleep_ms(500).await;
+    }
+    assert_eq!(
+        receiver
+            .get_asset_balance(asset_id.clone())
+            .unwrap()
+            .settled,
+        ASSET_AMOUNT
+    );
+    wallet.sync(online.clone()).await.unwrap();
+    wallet
+        .refresh(online.clone(), None, vec![], false)
+        .await
+        .unwrap();
+    assert_eq!(wallet.get_asset_balance(asset_id).unwrap().future, 0);
 }
 
 #[wasm_bindgen_test]

@@ -29,10 +29,12 @@ impl DbBatchTransfer {
             .filter(|t| t.batch_transfer_idx == self.idx)
             .map(|t| t.idx)
             .collect();
-        Ok(transfers
+        let mut transfers = transfers
             .iter()
             .filter(|t| asset_transfer_ids.contains(&t.asset_transfer_idx))
-            .all(|t| t.incoming))
+            .peekable();
+        // on-chain swap receives have no transfer rows: they are refreshed as outgoing batches
+        Ok(transfers.peek().is_some() && transfers.all(|t| t.incoming))
     }
 
     pub(crate) fn get_asset_transfers(
