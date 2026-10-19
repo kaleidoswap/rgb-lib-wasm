@@ -35,9 +35,9 @@ jobs:
           VERSION="${{ inputs.version }}"
           node -e "
             const pkg = require('./package.json');
-            pkg.name = '@utexo/rgb-lib-wasm';
+            pkg.name = '@kaleidorg/rgb-lib-wasm';
             pkg.version = '$VERSION';
-            pkg.repository = { type: 'git', url: 'https://github.com/UTEXO-Protocol/rgb-lib-wasm.git' };
+            pkg.repository = { type: 'git', url: 'https://github.com/kaleidoswap/rgb-lib-wasm.git' };
             require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
           "
           cat package.json
@@ -107,10 +107,10 @@ jobs:
             ### Installation
             
             ```bash
-            npm install @utexo/rgb-lib-wasm@${{ steps.version.outputs.version }}
+            npm install @kaleidorg/rgb-lib-wasm@${{ steps.version.outputs.version }}
             ```
           draft: false
-          prerelease: ${{ contains(steps.version.outputs.version, 'alpha') || contains(steps.version.outputs.version, 'beta') || contains(steps.version.outputs.version, 'rc') }}
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
           files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
