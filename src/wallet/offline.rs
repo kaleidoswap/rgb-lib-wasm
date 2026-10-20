@@ -3418,7 +3418,6 @@ pub(crate) fn swap_random_blinding() -> u64 {
 
 /// Derive a deterministic MPC entropy for a swap from its identifier. Both parties compute the
 /// same value so the MPC commitment they each (re)produce is identical.
-
 pub(crate) fn swap_mpc_entropy(swap_id: &str) -> u64 {
     let hash = hash_bytes_hex(swap_id.as_bytes());
     let mut bytes = [0u8; 8];
@@ -3576,7 +3575,6 @@ pub(crate) fn swap_validate_proxy_url(proxy_url: &Option<String>) -> Result<(), 
 /// Build the coloring for a swap RGB leg: `leg.amount` goes to `recipient_vout` and everything
 /// else the inputs carry (`available`, per contract) goes back to `change_vout`. Vouts are final
 /// PSBT indices; the returned flag tells whether the map was shifted for an OP_RETURN-first PSBT.
-
 pub(crate) fn swap_rgb_leg_coloring_info(
     leg: &OnchainSwapLeg,
     psbt: &Psbt,
