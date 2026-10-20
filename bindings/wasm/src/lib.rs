@@ -895,6 +895,20 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    /// Cancel every swap whose offer has expired and whose transaction has not been broadcast.
+    /// Returns the cancelled swap IDs.
+    #[wasm_bindgen(js_name = "cancelExpiredSwaps")]
+    pub async fn cancel_expired_swaps(&self, online_js: JsValue) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Online object: {e}")))?;
+        let mut wallet = self.inner.borrow_mut();
+        let swap_ids = wallet
+            .cancel_expired_swaps(online)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&swap_ids)
+    }
+
     /// List the swaps this wallet has state for, including cancelled ones.
     #[wasm_bindgen(js_name = "listSwaps")]
     pub fn list_swaps(&self) -> Result<JsValue, JsValue> {

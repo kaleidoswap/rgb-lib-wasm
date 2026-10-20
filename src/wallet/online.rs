@@ -320,6 +320,38 @@ impl Indexer {
         })
     }
 
+    /// The output at `outpoint` if its transaction is known and the output is unspent, counting
+    /// mempool spends.
+    pub(crate) async fn get_unspent_txout(
+        &self,
+        outpoint: &BdkOutPoint,
+    ) -> Result<Option<TxOut>, Error> {
+        Ok(match self {
+            Indexer::EsploraAsync(client) => {
+                // the outspend endpoint reports an unknown outpoint as unspent, so fetch the
+                // funding tx first
+                let Some(tx) = client
+                    .get_tx(&outpoint.txid)
+                    .await
+                    .map_err(IndexerError::from)?
+                else {
+                    return Ok(None);
+                };
+                let Some(txout) = tx.output.get(outpoint.vout as usize).cloned() else {
+                    return Ok(None);
+                };
+                match client
+                    .get_output_status(&outpoint.txid, outpoint.vout as u64)
+                    .await
+                    .map_err(IndexerError::from)?
+                {
+                    Some(status) if !status.spent => Some(txout),
+                    _ => None,
+                }
+            }
+        })
+    }
+
     pub(crate) async fn get_tx_height(&self, txid: &str) -> Result<Option<u32>, Error> {
         Ok(match self {
             Indexer::EsploraAsync(client) => {
@@ -4111,6 +4143,31 @@ impl Wallet {
         Ok(())
     }
 
+    /// Refuse swap inputs that are spent (mempool included), unknown, or whose declared amount or
+    /// script differs from the chain: signing over them wastes the swap, as the transaction can
+    /// never be mined, and the PSBT checks rely on the declared values.
+    async fn swap_ensure_inputs_on_chain(&self, inputs: &[OnchainSwapInput]) -> Result<(), Error> {
+        for input in inputs {
+            let Some(txout) = self
+                .indexer()
+                .get_unspent_txout(&swap_input_to_outpoint(input))
+                .await?
+            else {
+                return Err(swap_invalid(format!(
+                    "swap input {} is already spent or does not exist",
+                    input.outpoint
+                )));
+            };
+            if txout != swap_input_txout(input)? {
+                return Err(swap_invalid(format!(
+                    "swap input {} does not match the chain",
+                    input.outpoint
+                )));
+            }
+        }
+        Ok(())
+    }
+
     async fn swap_select_btc_inputs(
         &self,
         needed_sat: u64,
@@ -4239,13 +4296,13 @@ impl Wallet {
         };
         let (_, _, mut input_unspents, _) = self._get_transfer_begin_data(online, 1)?;
         input_unspents.retain(|u| !excluded.contains(&(u.utxo.txid.as_str(), u.utxo.vout)));
-        let selected = self._select_rgb_inputs(asset_id, &assignments, input_unspents)?;
+        let selected = self._select_rgb_inputs(asset_id.clone(), &assignments, input_unspents)?;
         let selected_outpoints = selected
             .txo_map
             .into_values()
             .map(BdkOutPoint::from)
             .collect::<HashSet<_>>();
-        let swap_inputs = self
+        let mut swap_inputs = self
             .bdk_wallet
             .list_unspent()
             .filter(|o| selected_outpoints.contains(&o.outpoint))
@@ -4254,15 +4311,42 @@ impl Wallet {
         if swap_inputs.is_empty() {
             return Err(swap_invalid("could not resolve selected RGB inputs"));
         }
-        let total = swap_selected_inputs_total(&swap_inputs);
-        if total < extra_sat {
-            return Err(Error::InsufficientBitcoins {
-                needed: extra_sat,
-                available: total,
-            });
-        }
         self.swap_ensure_inputs_confirmed(&swap_inputs, min_confirmations)
             .await?;
+        // RGB change (of this asset or of others sharing the inputs) is carried by this side's
+        // change output, which then has to be above dust
+        let contract_id = ContractId::from_str(&asset_id).expect("invalid contract ID");
+        let rgb_change = swap_input_rgb_amounts(self, &selected_outpoints)?
+            .into_iter()
+            .any(|(cid, amount)| amount > if cid == contract_id { leg.amount } else { 0 });
+        let needed = if rgb_change {
+            let dust = self
+                .bdk_wallet
+                .public_descriptor(KeychainKind::External)
+                .dust_value()
+                .to_sat();
+            extra_sat
+                .checked_add(dust)
+                .ok_or_else(|| swap_invalid("swap amounts overflow"))?
+        } else {
+            extra_sat
+        };
+        let total = swap_selected_inputs_total(&swap_inputs);
+        if total < needed {
+            // colored UTXOs usually hold too few sats to pay for this side, so top them up with
+            // plain BTC inputs, as the BTC-giving side does
+            let btc_inputs = self
+                .swap_select_btc_inputs(needed - total, min_confirmations, excluded)
+                .await
+                .map_err(|e| match e {
+                    Error::InsufficientBitcoins { available, .. } => Error::InsufficientBitcoins {
+                        needed,
+                        available: total.saturating_add(available),
+                    },
+                    e => e,
+                })?;
+            swap_inputs.extend(btc_inputs);
+        }
         Ok(swap_inputs)
     }
 
@@ -4601,6 +4685,8 @@ impl Wallet {
                 KeychainKind::External,
             ),
         };
+        // with skip_sync the local view of these coins can be stale
+        self.swap_ensure_inputs_on_chain(&taker_inputs).await?;
         let (taker_btc_address, taker_rgb_recipient_id, taker_rgb_script, taker_rgb_blinding) =
             if matches!(taker_receives.kind, OnchainSwapLegKind::Btc) {
                 let address = self._get_new_address(KeychainKind::Internal)?;
@@ -4696,6 +4782,8 @@ impl Wallet {
             .cloned()
             .collect::<Vec<_>>();
         swap_restore_input_metadata(&mut psbt, &all_inputs)?;
+        // before anything is staged for this swap
+        self.swap_ensure_inputs_on_chain(&all_inputs).await?;
 
         let mut consignments = proposal.consignments.clone();
         match direction {
@@ -5056,6 +5144,40 @@ impl Wallet {
         self.flush().await?;
         info!(self.logger, "Cancel swap completed");
         Ok(())
+    }
+
+    /// Cancel every on-chain swap whose offer has expired and whose transaction has not been
+    /// broadcast, as [`cancel_swap`](Wallet::cancel_swap) does. Returns the cancelled swap IDs.
+    pub async fn cancel_expired_swaps(&mut self, online: Online) -> Result<Vec<String>, Error> {
+        info!(self.logger, "Cancelling expired on-chain swaps...");
+        self.check_online(online.clone())?;
+        let current_timestamp = now().unix_timestamp();
+        let expired = self
+            .database
+            .iter_swaps()?
+            .into_iter()
+            .filter(|s| {
+                !matches!(
+                    s.stage,
+                    OnchainSwapStage::Broadcast
+                        | OnchainSwapStage::Accepted
+                        | OnchainSwapStage::Cancelled
+                ) && s
+                    .expiration_timestamp
+                    .is_some_and(|e| e <= current_timestamp)
+            })
+            .map(|s| s.swap_id)
+            .collect::<Vec<_>>();
+        let mut swap_ids = vec![];
+        for swap_id in expired {
+            match self.cancel_swap(online.clone(), swap_id.clone()).await {
+                Ok(()) => swap_ids.push(swap_id),
+                Err(Error::CannotFailBatchTransfer) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        info!(self.logger, "Cancel expired swaps completed");
+        Ok(swap_ids)
     }
 
     /// List the on-chain swaps this wallet has state for, including cancelled ones.
