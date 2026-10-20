@@ -194,6 +194,17 @@ pub enum Assignment {
 }
 
 impl Assignment {
+    /// A fungible owned state of type `ty`, or `None` for a type the wallet's schemas don't
+    /// define as fungible.
+    #[cfg(feature = "esplora")]
+    pub(crate) fn fungible(ty: rgbstd::AssignmentType, amount: u64) -> Option<Self> {
+        match ty {
+            OS_ASSET => Some(Self::Fungible(amount)),
+            OS_INFLATION => Some(Self::InflationRight(amount)),
+            _ => None,
+        }
+    }
+
     #[cfg(feature = "esplora")]
     pub(crate) fn from_opout_and_state(opout: Opout, state: &AllocatedState) -> Self {
         match state {

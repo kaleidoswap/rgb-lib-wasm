@@ -3155,7 +3155,10 @@ impl Wallet {
         use crate::database::memory_db::{ActiveValue, DbBackupInfoActMod};
 
         let now_str = {
+            #[cfg(target_arch = "wasm32")]
             let ms = js_sys::Date::now() as i64;
+            #[cfg(not(target_arch = "wasm32"))]
+            let ms = (now().unix_timestamp_nanos() / 1_000_000) as i64;
             let secs = ms / 1000;
             let nanos = ((ms % 1000) * 1_000_000) as u32;
             let dt = time::OffsetDateTime::from_unix_timestamp(secs)
@@ -3209,6 +3212,7 @@ impl Wallet {
 
     /// Trigger an async save of wallet state to IndexedDB.
     pub(crate) fn trigger_auto_backup(&self) {
+        #[cfg(target_arch = "wasm32")]
         self.save_to_idb();
     }
 
@@ -3256,6 +3260,7 @@ impl Wallet {
     }
 
     /// Save current wallet state to IndexedDB asynchronously via spawn_local.
+    #[cfg(target_arch = "wasm32")]
     fn save_to_idb(&self) {
         use std::sync::atomic::Ordering;
 
@@ -3413,7 +3418,6 @@ pub(crate) fn swap_random_blinding() -> u64 {
 
 /// Derive a deterministic MPC entropy for a swap from its identifier. Both parties compute the
 /// same value so the MPC commitment they each (re)produce is identical.
-
 pub(crate) fn swap_mpc_entropy(swap_id: &str) -> u64 {
     let hash = hash_bytes_hex(swap_id.as_bytes());
     let mut bytes = [0u8; 8];
@@ -3571,7 +3575,6 @@ pub(crate) fn swap_validate_proxy_url(proxy_url: &Option<String>) -> Result<(), 
 /// Build the coloring for a swap RGB leg: `leg.amount` goes to `recipient_vout` and everything
 /// else the inputs carry (`available`, per contract) goes back to `change_vout`. Vouts are final
 /// PSBT indices; the returned flag tells whether the map was shifted for an OP_RETURN-first PSBT.
-
 pub(crate) fn swap_rgb_leg_coloring_info(
     leg: &OnchainSwapLeg,
     psbt: &Psbt,
