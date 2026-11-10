@@ -184,6 +184,14 @@ pub(crate) struct TransferArtifacts {
     pub(crate) signed_psbt: Option<String>,
 }
 
+/// Where a consignment paying a pending receive came from.
+pub(crate) enum ReceivedConsignmentSource {
+    /// Fetched from this proxy
+    Proxy(String),
+    /// Handed over by the wallet itself (e.g. by a PSBT operation it applied)
+    Provided,
+}
+
 async fn pending_consignment_matches(
     proxy_client: &WasmProxyClient,
     endpoint: &str,
@@ -2065,6 +2073,176 @@ impl Wallet {
         ))
     }
 
+    async fn _refuse_received_consignment(
+        &self,
+        source: &ReceivedConsignmentSource,
+        recipient_id: String,
+        updated_batch_transfer: &mut DbBatchTransferActMod,
+    ) -> Result<Option<DbBatchTransfer>, Error> {
+        match source {
+            ReceivedConsignmentSource::Proxy(proxy_url) => {
+                self._refuse_consignment_async(
+                    proxy_url.clone(),
+                    recipient_id,
+                    updated_batch_transfer,
+                )
+                .await
+            }
+            ReceivedConsignmentSource::Provided => {
+                debug!(
+                    self.logger,
+                    "Refusing invalid provided consignment for {recipient_id}"
+                );
+                updated_batch_transfer.status = ActiveValue::Set(TransferStatus::Failed);
+                Ok(Some(
+                    self.database
+                        .update_batch_transfer(updated_batch_transfer)?,
+                ))
+            }
+        }
+    }
+
+    /// Hand `consignment_bytes` to every pending receive of this wallet it pays, as a
+    /// counterparty's consignment would be, and return what changed.
+    pub(crate) async fn provide_consignment_to_receives(
+        &mut self,
+        consignment_bytes: Vec<u8>,
+    ) -> Result<RefreshResult, Error> {
+        let no_match = || Error::CannotProvideOutOfBandConsignment {
+            details: s!("no pending receive transfer matches the provided consignment"),
+        };
+        let consignment = RgbTransfer::load(&consignment_bytes[..]).map_err(|_| {
+            Error::CannotProvideOutOfBandConsignment {
+                details: s!("invalid consignment"),
+            }
+        })?;
+        let asset_id = consignment.contract_id().to_string();
+        let Some(ab) = consignment.bundles.last() else {
+            return Err(no_match());
+        };
+        let witness_id = ab.witness_id();
+
+        let db_data = self.database.get_db_data(false)?;
+        let mut matches = vec![];
+        for batch_transfer in &db_data.batch_transfers {
+            if !batch_transfer.waiting_counterparty()
+                || !batch_transfer.incoming(&db_data.asset_transfers, &db_data.transfers)?
+            {
+                continue;
+            }
+            let batch_transfer_data =
+                batch_transfer.get_transfers(&db_data.asset_transfers, &db_data.transfers)?;
+            let (asset_transfer, transfer) =
+                self.database.get_incoming_transfer(&batch_transfer_data)?;
+            if asset_transfer
+                .asset_id
+                .as_ref()
+                .is_some_and(|aid| aid != &asset_id)
+            {
+                continue;
+            }
+            let Some(recipient_id) = transfer.recipient_id.clone() else {
+                continue;
+            };
+            let matched = match transfer.recipient_type {
+                Some(RecipientTypeFull::Blind { .. }) => {
+                    let beneficiary = XChainNet::<Beneficiary>::from_str(&recipient_id)
+                        .map_err(|_| Error::InvalidRecipientID)?;
+                    match beneficiary.into_inner() {
+                        Beneficiary::BlindedSeal(secret_seal)
+                            if !self
+                                .extract_received_assignments(
+                                    &consignment,
+                                    witness_id,
+                                    None,
+                                    Some(secret_seal),
+                                )
+                                .is_empty() =>
+                        {
+                            Some(None)
+                        }
+                        _ => None,
+                    }
+                }
+                Some(RecipientTypeFull::Witness { .. }) => {
+                    let script_pubkey = script_buf_from_recipient_id(recipient_id.clone())?;
+                    match &ab.pub_witness {
+                        PubWitness::Tx(tx) => tx
+                            .output
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, output)| {
+                                Some(&output.script_pubkey) == script_pubkey.as_ref()
+                            })
+                            .map(|(idx, _)| idx as u32)
+                            .find(|vout| {
+                                !self
+                                    .extract_received_assignments(
+                                        &consignment,
+                                        witness_id,
+                                        Some(*vout),
+                                        None,
+                                    )
+                                    .is_empty()
+                            })
+                            .map(Some),
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            if let Some(vout) = matched {
+                matches.push((
+                    batch_transfer.clone(),
+                    asset_transfer,
+                    transfer,
+                    recipient_id,
+                    vout,
+                ));
+            }
+        }
+        if matches.is_empty() {
+            return Err(no_match());
+        }
+        // under address reuse several pending receives can share a recipient ID, and the
+        // consignment cannot tell which one it pays
+        let mut seen_recipient_ids = HashSet::new();
+        for (_, _, _, recipient_id, _) in &matches {
+            if !seen_recipient_ids.insert(recipient_id.clone()) {
+                return Err(Error::CannotProvideOutOfBandConsignment {
+                    details: format!(
+                        "ambiguous recipient {recipient_id}: multiple pending transfers share \
+                         this recipient ID (address reuse), cannot disambiguate out-of-band"
+                    ),
+                });
+            }
+        }
+
+        let mut results: RefreshResult = HashMap::new();
+        for (batch_transfer, asset_transfer, transfer, recipient_id, vout) in matches {
+            let updated = self
+                ._process_received_consignment(
+                    &batch_transfer,
+                    &asset_transfer,
+                    &transfer,
+                    recipient_id,
+                    consignment_bytes.clone(),
+                    witness_id.to_string(),
+                    vout,
+                    ReceivedConsignmentSource::Provided,
+                )
+                .await?;
+            results.insert(
+                batch_transfer.idx,
+                RefreshedTransfer {
+                    updated_status: updated.map(|t| t.status),
+                    failure: None,
+                },
+            );
+        }
+        Ok(results)
+    }
+
     pub(crate) async fn _get_consignment_async(
         &self,
         proxy_url: &str,
@@ -2176,6 +2354,36 @@ impl Wallet {
             }
         };
 
+        self._process_received_consignment(
+            batch_transfer,
+            &asset_transfer,
+            &transfer,
+            recipient_id,
+            consignment_bytes,
+            txid,
+            vout,
+            ReceivedConsignmentSource::Proxy(proxy_url),
+        )
+        .await
+    }
+
+    /// Validate a consignment paying a pending receive and move the receive to
+    /// `WaitingConfirmations`, or refuse it. `source` says where it came from: a proxy is
+    /// ACKed/NACKed and serves the contract media, a provided consignment is neither.
+    #[allow(clippy::too_many_arguments)]
+    async fn _process_received_consignment(
+        &mut self,
+        batch_transfer: &DbBatchTransfer,
+        asset_transfer: &DbAssetTransfer,
+        transfer: &DbTransfer,
+        recipient_id: String,
+        consignment_bytes: Vec<u8>,
+        txid: String,
+        vout: Option<u32>,
+        source: ReceivedConsignmentSource,
+    ) -> Result<Option<DbBatchTransfer>, Error> {
+        let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
+
         // store consignment bytes in memory
         self.received_consignments
             .insert(recipient_id.clone(), consignment_bytes.clone());
@@ -2186,7 +2394,11 @@ impl Wallet {
             Err(e) => {
                 error!(self.logger, "Failed to deserialize consignment: {e}");
                 return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    ._refuse_received_consignment(
+                        &source,
+                        recipient_id,
+                        &mut updated_batch_transfer,
+                    )
                     .await;
             }
         };
@@ -2201,7 +2413,11 @@ impl Wallet {
                     "Received a different asset than the expected one"
                 );
                 return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    ._refuse_received_consignment(
+                        &source,
+                        recipient_id,
+                        &mut updated_batch_transfer,
+                    )
                     .await;
             }
         }
@@ -2211,7 +2427,11 @@ impl Wallet {
             Err(_) => {
                 error!(self.logger, "Received an invalid TXID from the proxy");
                 return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    ._refuse_received_consignment(
+                        &source,
+                        recipient_id,
+                        &mut updated_batch_transfer,
+                    )
                     .await;
             }
         };
@@ -2237,7 +2457,11 @@ impl Wallet {
             Err(ValidationError::InvalidConsignment(e)) => {
                 error!(self.logger, "Consignment is invalid: {}", e);
                 return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    ._refuse_received_consignment(
+                        &source,
+                        recipient_id,
+                        &mut updated_batch_transfer,
+                    )
                     .await;
             }
             Err(ValidationError::ResolverError(e)) => {
@@ -2269,8 +2493,8 @@ impl Wallet {
                                     "The provided vout pays an incorrect script pubkey"
                                 );
                                 return self
-                                    ._refuse_consignment_async(
-                                        proxy_url,
+                                    ._refuse_received_consignment(
+                                        &source,
                                         recipient_id,
                                         &mut updated_batch_transfer,
                                     )
@@ -2279,8 +2503,8 @@ impl Wallet {
                         } else {
                             error!(self.logger, "Cannot find the expected outpoint");
                             return self
-                                ._refuse_consignment_async(
-                                    proxy_url,
+                                ._refuse_received_consignment(
+                                    &source,
                                     recipient_id,
                                     &mut updated_batch_transfer,
                                 )
@@ -2289,8 +2513,8 @@ impl Wallet {
                     } else {
                         error!(self.logger, "Consignment is missing the witness TX");
                         return self
-                            ._refuse_consignment_async(
-                                proxy_url,
+                            ._refuse_received_consignment(
+                                &source,
                                 recipient_id,
                                 &mut updated_batch_transfer,
                             )
@@ -2302,8 +2526,8 @@ impl Wallet {
                         "The vout should be provided when receiving via witness"
                     );
                     return self
-                        ._refuse_consignment_async(
-                            proxy_url,
+                        ._refuse_received_consignment(
+                            &source,
                             recipient_id,
                             &mut updated_batch_transfer,
                         )
@@ -2316,7 +2540,7 @@ impl Wallet {
                 "Cannot find the provided TXID in the consignment"
             );
             return self
-                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                ._refuse_received_consignment(&source, recipient_id, &mut updated_batch_transfer)
                 .await;
         }
 
@@ -2326,7 +2550,7 @@ impl Wallet {
                 "The wallet doesn't support the provided schema: {}", asset_schema
             );
             return self
-                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                ._refuse_received_consignment(&source, recipient_id, &mut updated_batch_transfer)
                 .await;
         }
 
@@ -2346,7 +2570,7 @@ impl Wallet {
         if received.is_empty() {
             error!(self.logger, "Cannot find any receiving assignment");
             return self
-                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                ._refuse_received_consignment(&source, recipient_id, &mut updated_batch_transfer)
                 .await;
         };
 
@@ -2377,8 +2601,8 @@ impl Wallet {
                         to_reject.len()
                     );
                     return self
-                        ._refuse_consignment_async(
-                            proxy_url,
+                        ._refuse_received_consignment(
+                            &source,
                             recipient_id,
                             &mut updated_batch_transfer,
                         )
@@ -2419,11 +2643,24 @@ impl Wallet {
                 };
                 for attachment in attachments {
                     let digest = hex::encode(attachment.digest);
+                    let ReceivedConsignmentSource::Proxy(proxy_url) = &source else {
+                        error!(
+                            self.logger,
+                            "Cannot fetch the media file of a provided consignment"
+                        );
+                        return self
+                            ._refuse_received_consignment(
+                                &source,
+                                recipient_id,
+                                &mut updated_batch_transfer,
+                            )
+                            .await;
+                    };
                     // on wasm32, skip media file download/storage (no filesystem)
                     // media digest is recorded in DB but file is not stored locally
                     let media_res = self
                         .wasm_proxy_client
-                        .get_media(&proxy_url, digest.clone())
+                        .get_media(proxy_url, digest.clone())
                         .await?;
                     if let Some(media_res) = media_res.result {
                         let file_bytes = general_purpose::STANDARD
@@ -2437,8 +2674,8 @@ impl Wallet {
                                 "Attached file has a different hash than the one in the contract"
                             );
                             return self
-                                ._refuse_consignment_async(
-                                    proxy_url,
+                                ._refuse_received_consignment(
+                                    &source,
                                     recipient_id,
                                     &mut updated_batch_transfer,
                                 )
@@ -2451,8 +2688,8 @@ impl Wallet {
                             "Cannot find the media file but the contract defines one"
                         );
                         return self
-                            ._refuse_consignment_async(
-                                proxy_url,
+                            ._refuse_received_consignment(
+                                &source,
                                 recipient_id,
                                 &mut updated_batch_transfer,
                             )
@@ -2486,22 +2723,24 @@ impl Wallet {
             "Consignment is valid. Received '{:?}' of contract '{}'", received, asset_id
         );
 
-        match self
-            .wasm_proxy_client
-            .post_ack(&proxy_url, recipient_id, true)
-            .await
-        {
-            Ok(r) => {
-                debug!(self.logger, "Consignment ACK response: {:?}", r);
-            }
-            Err(e) if e.to_string().contains("Cannot change ACK") => {
-                warn!(self.logger, "Found an NACK when trying ACK");
-            }
-            Err(e) => {
-                error!(self.logger, "Failed to post ACK: {e}");
-                return Err(e);
-            }
-        };
+        if let ReceivedConsignmentSource::Proxy(proxy_url) = &source {
+            match self
+                .wasm_proxy_client
+                .post_ack(proxy_url, recipient_id, true)
+                .await
+            {
+                Ok(r) => {
+                    debug!(self.logger, "Consignment ACK response: {:?}", r);
+                }
+                Err(e) if e.to_string().contains("Cannot change ACK") => {
+                    warn!(self.logger, "Found an NACK when trying ACK");
+                }
+                Err(e) => {
+                    error!(self.logger, "Failed to post ACK: {e}");
+                    return Err(e);
+                }
+            };
+        }
 
         let utxo_idx = match transfer.recipient_type {
             Some(RecipientTypeFull::Blind { ref unblinded_utxo }) => {
@@ -2989,6 +3228,9 @@ impl Wallet {
                 transfers_changed = true;
                 self._try_fail_batch_transfer_async(batch_transfer, false, &mut db_data)
                     .await?
+            }
+            if !no_asset_only {
+                transfers_changed |= self.psbt_op_sweep_expired().await?;
             }
         }
 

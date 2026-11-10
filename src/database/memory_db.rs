@@ -2,7 +2,7 @@
 #![allow(clippy::derivable_impls)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +13,7 @@ use crate::database::enums::{
 };
 use crate::database::{DbBatchTransferData, LocalRgbAllocation, LocalUnspent};
 use crate::error::InternalError;
+use crate::wallet::rust_only::{PsbtBroadcastState, PsbtOpForeignInput, PsbtOperationStatus};
 use crate::wallet::{Balance, OnchainSwapRole, OnchainSwapStage, Outpoint};
 
 /// Lightweight ActiveValue (mirrors sea_orm::ActiveValue without the dependency).
@@ -222,6 +223,45 @@ pub struct DbSwapActMod {
     pub completion: ActiveValue<Option<String>>,
     pub outgoing_batch_transfer_idx: ActiveValue<Option<i32>>,
     pub outgoing_fascia: ActiveValue<Option<String>>,
+    pub created_at: ActiveValue<i64>,
+    pub updated_at: ActiveValue<i64>,
+}
+
+/// A colored PSBT operation (the `psbt_op_*` API): what native rgb-lib keeps in its operation
+/// directory, as one row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DbPsbtOp {
+    pub idx: i32,
+    pub operation_id: String,
+    pub status: PsbtOperationStatus,
+    pub broadcast: PsbtBroadcastState,
+    pub txid: String,
+    pub colored_psbt: String,
+    /// The committed fascia, as JSON, consumed into the stash on apply
+    pub fascia: String,
+    /// Spent allocations on outpoints this wallet doesn't hold
+    pub foreign_inputs: Vec<PsbtOpForeignInput>,
+    /// Consignment bytes per asset ID
+    pub consignments: BTreeMap<String, Vec<u8>>,
+    pub batch_transfer_idx: Option<i32>,
+    pub expiration_timestamp: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DbPsbtOpActMod {
+    pub idx: ActiveValue<i32>,
+    pub operation_id: ActiveValue<String>,
+    pub status: ActiveValue<PsbtOperationStatus>,
+    pub broadcast: ActiveValue<PsbtBroadcastState>,
+    pub txid: ActiveValue<String>,
+    pub colored_psbt: ActiveValue<String>,
+    pub fascia: ActiveValue<String>,
+    pub foreign_inputs: ActiveValue<Vec<PsbtOpForeignInput>>,
+    pub consignments: ActiveValue<BTreeMap<String, Vec<u8>>>,
+    pub batch_transfer_idx: ActiveValue<Option<i32>>,
+    pub expiration_timestamp: ActiveValue<Option<i64>>,
     pub created_at: ActiveValue<i64>,
     pub updated_at: ActiveValue<i64>,
 }
@@ -509,6 +549,11 @@ pub struct InMemoryDb {
     swaps: RefCell<Vec<DbSwap>>,
     #[serde(default = "first_idx")]
     next_swap_idx: RefCell<i32>,
+    // absent from snapshots taken before PSBT operations were stored
+    #[serde(default)]
+    psbt_ops: RefCell<Vec<DbPsbtOp>>,
+    #[serde(default = "first_idx")]
+    next_psbt_op_idx: RefCell<i32>,
 }
 
 fn first_idx() -> RefCell<i32> {
@@ -544,6 +589,8 @@ impl InMemoryDb {
             next_backup_info_idx: RefCell::new(1),
             swaps: RefCell::new(Vec::new()),
             next_swap_idx: RefCell::new(1),
+            psbt_ops: RefCell::new(Vec::new()),
+            next_psbt_op_idx: RefCell::new(1),
         }
     }
 
@@ -678,6 +725,28 @@ impl InMemoryDb {
             updated_at: av(s.updated_at),
         };
         self.swaps.borrow_mut().push(row);
+        Ok(idx)
+    }
+
+    pub(crate) fn set_psbt_op(&self, o: DbPsbtOpActMod) -> Result<i32, InternalError> {
+        let idx = *self.next_psbt_op_idx.borrow();
+        *self.next_psbt_op_idx.borrow_mut() += 1;
+        let row = DbPsbtOp {
+            idx,
+            operation_id: av(o.operation_id),
+            status: av_or(o.status, PsbtOperationStatus::Prepared),
+            broadcast: av(o.broadcast),
+            txid: av(o.txid),
+            colored_psbt: av(o.colored_psbt),
+            fascia: av(o.fascia),
+            foreign_inputs: av(o.foreign_inputs),
+            consignments: av(o.consignments),
+            batch_transfer_idx: av(o.batch_transfer_idx),
+            expiration_timestamp: av(o.expiration_timestamp),
+            created_at: av(o.created_at),
+            updated_at: av(o.updated_at),
+        };
+        self.psbt_ops.borrow_mut().push(row);
         Ok(idx)
     }
 
@@ -955,6 +1024,31 @@ impl InMemoryDb {
         Ok(row.clone())
     }
 
+    pub(crate) fn update_psbt_op(&self, o: &mut DbPsbtOpActMod) -> Result<DbPsbtOp, InternalError> {
+        let operation_id = match &o.operation_id {
+            ActiveValue::Set(v) | ActiveValue::Unchanged(v) => v.clone(),
+            ActiveValue::NotSet => return Err(InternalError::Unexpected),
+        };
+        let mut ops = self.psbt_ops.borrow_mut();
+        let row = ops
+            .iter_mut()
+            .find(|r| r.operation_id == operation_id)
+            .ok_or(InternalError::Unexpected)?;
+        if let ActiveValue::Set(v) = &o.status {
+            row.status = *v;
+        }
+        if let ActiveValue::Set(v) = &o.broadcast {
+            row.broadcast = *v;
+        }
+        if let ActiveValue::Set(v) = &o.batch_transfer_idx {
+            row.batch_transfer_idx = *v;
+        }
+        if let ActiveValue::Set(v) = &o.updated_at {
+            row.updated_at = *v;
+        }
+        Ok(row.clone())
+    }
+
     pub(crate) fn update_transfer_transport_endpoint(
         &self,
         t: &mut DbTransferTransportEndpointActMod,
@@ -1104,6 +1198,18 @@ impl InMemoryDb {
             .cloned())
     }
 
+    pub(crate) fn get_psbt_op(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<DbPsbtOp>, InternalError> {
+        Ok(self
+            .psbt_ops
+            .borrow()
+            .iter()
+            .find(|o| o.operation_id == operation_id)
+            .cloned())
+    }
+
     pub(crate) fn get_swap(&self, swap_id: &str) -> Result<Option<DbSwap>, InternalError> {
         Ok(self
             .swaps
@@ -1158,6 +1264,17 @@ impl InMemoryDb {
         &self,
     ) -> Result<Vec<DbPendingWitnessScript>, InternalError> {
         Ok(self.pending_witness_scripts.borrow().clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_txo(&self, txid: &str, vout: u32) {
+        self.txos
+            .borrow_mut()
+            .retain(|t| !(t.txid == txid && t.vout == vout));
+    }
+
+    pub(crate) fn iter_psbt_ops(&self) -> Result<Vec<DbPsbtOp>, InternalError> {
+        Ok(self.psbt_ops.borrow().clone())
     }
 
     pub(crate) fn iter_swaps(&self) -> Result<Vec<DbSwap>, InternalError> {
@@ -2194,6 +2311,114 @@ mod tests {
         let restored: InMemoryDb = serde_json::from_value(json).unwrap();
         assert!(restored.iter_swaps().unwrap().is_empty());
         assert_eq!(restored.set_swap(make_swap_mod("swap_a")).unwrap(), 1);
+    }
+
+    // ── PSBT operation ─────────────────────────────────────────────
+
+    fn make_psbt_op_mod(operation_id: &str, txid: &str) -> DbPsbtOpActMod {
+        DbPsbtOpActMod {
+            operation_id: ActiveValue::Set(operation_id.to_string()),
+            status: ActiveValue::Set(PsbtOperationStatus::Prepared),
+            txid: ActiveValue::Set(txid.to_string()),
+            colored_psbt: ActiveValue::Set("cHNidP8=".to_string()),
+            fascia: ActiveValue::Set("{}".to_string()),
+            foreign_inputs: ActiveValue::Set(vec![PsbtOpForeignInput {
+                asset_id: "rgb:asset".to_string(),
+                outpoint: Outpoint {
+                    txid: "cd".repeat(32),
+                    vout: 1,
+                },
+                assignments: vec![Assignment::Fungible(42)],
+            }]),
+            consignments: ActiveValue::Set(BTreeMap::from([(
+                "rgb:asset".to_string(),
+                vec![1, 2, 3],
+            )])),
+            batch_transfer_idx: ActiveValue::Set(Some(7)),
+            created_at: ActiveValue::Set(1000),
+            updated_at: ActiveValue::Set(1000),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_psbt_op_set_get_update_iter() {
+        let db = make_db();
+        assert_eq!(db.set_psbt_op(make_psbt_op_mod("op_a", "tx_a")).unwrap(), 1);
+        assert_eq!(db.set_psbt_op(make_psbt_op_mod("op_b", "tx_b")).unwrap(), 2);
+        assert_eq!(db.iter_psbt_ops().unwrap().len(), 2);
+        assert!(db.get_psbt_op("missing").unwrap().is_none());
+
+        let row = db.get_psbt_op("op_a").unwrap().unwrap();
+        assert_eq!(row.status, PsbtOperationStatus::Prepared);
+        assert_eq!(row.broadcast, PsbtBroadcastState::NotAttempted);
+        assert_eq!(row.expiration_timestamp, None);
+
+        let updated = db
+            .update_psbt_op(&mut DbPsbtOpActMod {
+                operation_id: ActiveValue::Unchanged("op_a".to_string()),
+                broadcast: ActiveValue::Set(PsbtBroadcastState::Attempted),
+                updated_at: ActiveValue::Set(1500),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(updated.broadcast, PsbtBroadcastState::Attempted);
+        assert_eq!(updated.status, PsbtOperationStatus::Prepared);
+        assert_eq!(updated.updated_at, 1500);
+        assert_eq!(updated.consignments, row.consignments);
+        assert_eq!(
+            db.get_psbt_op("op_b").unwrap().unwrap().broadcast,
+            PsbtBroadcastState::NotAttempted
+        );
+        assert!(
+            db.update_psbt_op(&mut DbPsbtOpActMod {
+                operation_id: ActiveValue::Unchanged("nope".to_string()),
+                status: ActiveValue::Set(PsbtOperationStatus::Failed),
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_psbt_ops_survive_a_snapshot_round_trip() {
+        let db = make_db();
+        db.set_psbt_op(make_psbt_op_mod("op_a", "tx_a")).unwrap();
+        db.update_psbt_op(&mut DbPsbtOpActMod {
+            operation_id: ActiveValue::Unchanged("op_a".to_string()),
+            status: ActiveValue::Set(PsbtOperationStatus::Applied),
+            broadcast: ActiveValue::Set(PsbtBroadcastState::Observed),
+            ..Default::default()
+        })
+        .unwrap();
+        let restored: InMemoryDb =
+            serde_json::from_str(&serde_json::to_string(&db).unwrap()).unwrap();
+        assert_eq!(
+            restored.get_psbt_op("op_a").unwrap(),
+            db.get_psbt_op("op_a").unwrap()
+        );
+        assert_eq!(
+            restored
+                .set_psbt_op(make_psbt_op_mod("op_b", "tx_b"))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_snapshot_from_before_psbt_ops_still_loads() {
+        let mut json: serde_json::Value = serde_json::to_value(make_db()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("psbt_ops");
+        obj.remove("next_psbt_op_idx");
+        let restored: InMemoryDb = serde_json::from_value(json).unwrap();
+        assert!(restored.iter_psbt_ops().unwrap().is_empty());
+        assert_eq!(
+            restored
+                .set_psbt_op(make_psbt_op_mod("op_a", "tx_a"))
+                .unwrap(),
+            1
+        );
     }
 
     // ── WalletTransaction ──────────────────────────────────────────

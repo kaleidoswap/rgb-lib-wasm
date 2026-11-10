@@ -5,10 +5,10 @@ use super::*;
 pub(crate) use crate::database::memory_db::{
     ActiveValue, DbAsset, DbAssetActMod, DbAssetTransfer, DbAssetTransferActMod, DbBackupInfo,
     DbBackupInfoActMod, DbBatchTransfer, DbBatchTransferActMod, DbColoring, DbColoringActMod,
-    DbMedia, DbMediaActMod, DbPendingWitnessScript, DbPendingWitnessScriptActMod, DbSwap,
-    DbSwapActMod, DbTransfer, DbTransferActMod, DbTransferTransportEndpoint,
-    DbTransferTransportEndpointActMod, DbTransportEndpoint, DbTransportEndpointActMod, DbTxo,
-    DbTxoActMod, DbWalletTransaction, DbWalletTransactionActMod,
+    DbMedia, DbMediaActMod, DbPendingWitnessScript, DbPendingWitnessScriptActMod, DbPsbtOp,
+    DbPsbtOpActMod, DbSwap, DbSwapActMod, DbTransfer, DbTransferActMod,
+    DbTransferTransportEndpoint, DbTransferTransportEndpointActMod, DbTransportEndpoint,
+    DbTransportEndpointActMod, DbTxo, DbTxoActMod, DbWalletTransaction, DbWalletTransactionActMod,
 };
 
 #[derive(Clone, Debug)]

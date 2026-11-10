@@ -398,6 +398,19 @@ pub(crate) fn beneficiary_from_script_buf(script_buf: ScriptBuf) -> Beneficiary 
     Beneficiary::WitnessVout(Pay2Vout::new(address_payload), None)
 }
 
+/// Return the recipient ID for a script buf, or an error if it is not a standard address payload
+pub(crate) fn try_recipient_id_from_script_buf(
+    script_buf: &ScriptBuf,
+    bitcoin_network: BitcoinNetwork,
+) -> Result<String, Error> {
+    let address_payload =
+        AddressPayload::from_script(script_buf).map_err(|e| Error::InvalidAddress {
+            details: e.to_string(),
+        })?;
+    let beneficiary = Beneficiary::WitnessVout(Pay2Vout::new(address_payload), None);
+    Ok(XChainNet::with(bitcoin_network.into(), beneficiary).to_string())
+}
+
 /// Return the recipient ID for a specific script buf
 pub fn recipient_id_from_script_buf(
     script_buf: ScriptBuf,
@@ -524,10 +537,17 @@ pub(crate) fn setup_logger<P: AsRef<Path>>(
     Ok((logger, ()))
 }
 
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn now() -> OffsetDateTime {
     let ms = js_sys::Date::now();
     let secs = (ms / 1000.0).floor() as i64;
     OffsetDateTime::from_unix_timestamp(secs).unwrap_or(OffsetDateTime::UNIX_EPOCH)
+}
+
+// lets the native unit tests run wallet methods
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn now() -> OffsetDateTime {
+    OffsetDateTime::now_utc()
 }
 
 pub(crate) struct DumbResolver;
