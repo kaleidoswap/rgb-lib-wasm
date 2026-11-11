@@ -4416,11 +4416,35 @@ impl Wallet {
         min_confirmations: u8,
         excluded: &HashSet<(&str, u32)>,
     ) -> Result<Vec<OnchainSwapInput>, Error> {
+        // Empty RGB-capable outputs are safe BTC funding only when no asset or
+        // pending receive reserves them. Preserve two small outputs for RGB receives.
+        let db = self.database.get_db_data(false)?;
+        let unspent = self.database.get_unspent_txos(db.txos.clone())?;
+        let allocations = self.database.get_rgb_allocations(
+            unspent, Some(db.colorings), Some(db.batch_transfers),
+            Some(db.asset_transfers), Some(db.transfers),
+        )?;
+        let mut free = self.get_input_unspents(&allocations)?.into_iter()
+            .filter(|u| u.rgb_allocations.is_empty())
+            .collect::<Vec<_>>();
+        free.sort_by_key(|u| u.utxo.btc_amount.parse::<u64>().unwrap_or(0));
+        let reusable = free.into_iter().skip(2)
+            .map(|u| (u.utxo.txid, u.utxo.vout)).collect::<HashSet<_>>();
+        let mut reserved = HashSet::new();
+        for swap in self.database.iter_swaps()? {
+            if matches!(swap.stage, OnchainSwapStage::Cancelled | OnchainSwapStage::Accepted) { continue; }
+            if let Some(raw) = swap.request {
+                let request: OnchainSwapRequest = serde_json::from_str(&raw).map_err(InternalError::from)?;
+                for input in request.taker_inputs { reserved.insert((input.outpoint.txid, input.outpoint.vout)); }
+            }
+        }
         let mut selected = vec![];
         let mut total = 0u64;
-        for output in self.internal_unspents().filter(|o| {
+        for output in self.bdk_wallet.list_unspent().filter(|o| {
+            o.keychain == KeychainKind::Internal || reusable.contains(&(o.outpoint.txid.to_string(), o.outpoint.vout))
+        }).filter(|o| {
             let txid = o.outpoint.txid.to_string();
-            !o.is_spent && !excluded.contains(&(txid.as_str(), o.outpoint.vout))
+            !o.is_spent && !excluded.contains(&(txid.as_str(), o.outpoint.vout)) && !reserved.contains(&(txid, o.outpoint.vout))
         }) {
             if min_confirmations > 0 {
                 let confs = self
@@ -4436,7 +4460,7 @@ impl Wallet {
                 .checked_add(output.txout.value.to_sat())
                 .ok_or_else(|| swap_invalid("swap amounts overflow"))?;
             selected.push(swap_build_input(&output));
-            if total >= needed_sat {
+            if needed_sat > 0 && total >= needed_sat {
                 break;
             }
         }
@@ -4447,6 +4471,12 @@ impl Wallet {
             });
         }
         Ok(selected)
+    }
+
+    /// Confirmed BTC eligible for a swap, including empty unreserved RGB change.
+    pub async fn get_swap_funding_balance(&self, online: Online) -> Result<u64, Error> {
+        self.check_online(online)?;
+        Ok(swap_selected_inputs_total(&self.swap_select_btc_inputs(0, 1, &HashSet::new()).await?))
     }
 
     /// Fetch the consignment a swap counterparty posted to the proxy, validate it against the
@@ -5003,6 +5033,16 @@ impl Wallet {
         let local_request: OnchainSwapRequest =
             self.swap_load(&offer.swap_id, |s| s.request.as_ref(), "request")?;
         swap_ensure_state_matches(&local_request, &proposal.request, "request")?;
+        // Return the exact persisted signature after a worker crash, never recolor
+        // or sign another proposal for this accepted offer.
+        if let Some(saved) = self.database.get_swap(&offer.swap_id)? {
+            if let Some(raw) = saved.completion {
+                let completion: OnchainSwapCompletion = serde_json::from_str(&raw)
+                    .map_err(InternalError::from)?;
+                swap_ensure_state_matches(&completion.proposal, &proposal, "proposal")?;
+                return Ok(completion);
+            }
+        }
         let direction = swap_validate_legs(&offer.maker_gives, &offer.maker_receives)?;
         swap_ensure_supported(direction)?;
         swap_validate_proxy_url(&offer.proxy_url)?;
@@ -5114,6 +5154,14 @@ impl Wallet {
             taker_history: None,
             proposal,
         };
+        self.database.update_swap(&mut DbSwapActMod {
+            swap_id: ActiveValue::Unchanged(completion.proposal.request.offer.swap_id.clone()),
+            txid: ActiveValue::Set(Some(completion.txid.clone())),
+            completion: ActiveValue::Set(Some(serde_json::to_string(&completion).map_err(InternalError::from)?)),
+            updated_at: ActiveValue::Set(now().unix_timestamp()),
+            ..Default::default()
+        })?;
+        self.flush().await?;
         info!(self.logger, "Complete swap proposal completed");
         Ok(completion)
     }

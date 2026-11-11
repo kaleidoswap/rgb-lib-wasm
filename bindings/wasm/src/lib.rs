@@ -914,6 +914,15 @@ impl WasmWallet {
         to_js(&request)
     }
 
+    #[wasm_bindgen(js_name = "getSwapFundingBalance")]
+    pub async fn get_swap_funding_balance(&self, online_js: JsValue) -> Result<JsValue, JsValue> {
+        let online: Online = serde_wasm_bindgen::from_value(online_js)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let amount = self.inner.borrow().get_swap_funding_balance(online).await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        to_js(&amount)
+    }
+
     /// Complete a maker proposal as the taker. Returns the OnchainSwapCompletion to send to the
     /// maker, who signs last and broadcasts.
     #[wasm_bindgen(js_name = "completeSwapProposal")]
