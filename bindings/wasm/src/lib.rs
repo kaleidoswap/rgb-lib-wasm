@@ -147,6 +147,19 @@ impl WasmWallet {
         self.inner.borrow().last_save_error()
     }
 
+    /// Return the outcome of the migration of the 1.0.0-beta.3 snapshot of this wallet:
+    /// `null` when none ran, `{ status: "migrated" }`, or `{ status: "failed", error }`.
+    /// After a failed migration the wallet holds none of the RGB state of the 1.0.0-beta.3
+    /// snapshot: its RGB operations must not be used. The migration is tried again on the next
+    /// `create`.
+    #[wasm_bindgen(js_name = "legacyMigration")]
+    pub fn legacy_migration(&self) -> Result<JsValue, JsValue> {
+        match self.inner.borrow().legacy_migration() {
+            Some(migration) => to_js(&migration),
+            None => Ok(JsValue::NULL),
+        }
+    }
+
     /// Return the WalletData as a JS object.
     /// The mnemonic is not returned: `mnemonic` is null.
     #[wasm_bindgen(js_name = "getWalletData")]

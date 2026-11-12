@@ -44,6 +44,10 @@ pub struct WalletSnapshot {
     /// Pinned derivation index per keychain for address reuse.
     #[serde(default)]
     pub reuse_address_index: HashMap<KeychainKind, u32>,
+    /// Error of the last migration of the 1.0.0-beta.3 snapshot of this wallet, if it failed.
+    /// The migration is tried again on the next open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_migration_error: Option<String>,
 }
 
 #[wasm_bindgen]
@@ -214,6 +218,14 @@ pub(crate) fn deserialize_stock(store_b64: &str) -> Result<MemStock, String> {
 
 /// Load a wallet snapshot from IndexedDB for the given key.
 pub async fn load_snapshot(key: &str) -> Result<Option<WalletSnapshot>, String> {
+    load_raw(key)
+        .await?
+        .map(|json| serde_json::from_str(&json).map_err(|e| format!("Deserialize error: {e}")))
+        .transpose()
+}
+
+/// Load the JSON stored in IndexedDB under the given key.
+pub(crate) async fn load_raw(key: &str) -> Result<Option<String>, String> {
     let db = open_db().await?;
     let tx = db
         .transaction(&[STORE_NAME], idb::TransactionMode::ReadOnly)
@@ -229,17 +241,13 @@ pub async fn load_snapshot(key: &str) -> Result<Option<WalletSnapshot>, String> 
         .await
         .map_err(|e| format!("IndexedDB get error: {e:?}"))?;
 
-    match result {
-        Some(js_val) => {
-            let json_str = js_val
+    result
+        .map(|js_val| {
+            js_val
                 .as_string()
-                .ok_or_else(|| "IndexedDB value is not a string".to_string())?;
-            let snapshot: WalletSnapshot =
-                serde_json::from_str(&json_str).map_err(|e| format!("Deserialize error: {e}"))?;
-            Ok(Some(snapshot))
-        }
-        None => Ok(None),
-    }
+                .ok_or_else(|| "IndexedDB value is not a string".to_string())
+        })
+        .transpose()
 }
 
 #[cfg(test)]
@@ -356,6 +364,7 @@ mod tests {
             )]),
             rgb_store: s,
             reuse_address_index: HashMap::new(),
+            legacy_migration_error: None,
         };
 
         // JSON round-trip (what IndexedDB does)
