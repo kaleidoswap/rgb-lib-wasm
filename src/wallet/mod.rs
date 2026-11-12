@@ -9,6 +9,8 @@ pub(crate) mod offline;
 #[cfg(feature = "esplora")]
 pub(crate) mod online;
 pub mod rust_only;
+#[cfg(feature = "esplora")]
+pub(crate) mod swap;
 #[cfg(all(test, target_arch = "wasm32"))]
 mod test_bfa;
 #[cfg(all(test, target_arch = "wasm32"))]
