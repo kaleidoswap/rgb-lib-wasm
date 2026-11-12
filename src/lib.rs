@@ -207,9 +207,9 @@ use zeroize::Zeroizing;
 use crate::database::{
     DbAsset, DbAssetActMod, DbAssetTransfer, DbAssetTransferActMod, DbBackupInfo,
     DbBackupInfoActMod, DbBatchTransfer, DbBatchTransferActMod, DbColoring, DbColoringActMod,
-    DbMedia, DbMediaActMod, DbPendingWitnessScriptActMod, DbTransfer, DbTransferActMod,
-    DbTransferTransportEndpoint, DbTransferTransportEndpointActMod, DbTransportEndpoint,
-    DbTransportEndpointActMod, DbTxo,
+    DbMedia, DbMediaActMod, DbPendingWitnessScriptActMod, DbPsbtOp, DbPsbtOpActMod, DbSwap,
+    DbSwapActMod, DbTransfer, DbTransferActMod, DbTransferTransportEndpoint,
+    DbTransferTransportEndpointActMod, DbTransportEndpoint, DbTransportEndpointActMod, DbTxo,
 };
 #[cfg(feature = "esplora")]
 use crate::database::{DbTxoActMod, DbWalletTransactionActMod};
@@ -237,7 +237,7 @@ use crate::{
         verifying_key_from_bytes,
     },
     error::IndexerError,
-    utils::{INDEXER_STOP_GAP, script_buf_from_recipient_id},
+    utils::{INDEXER_STOP_GAP, script_buf_from_recipient_id, try_recipient_id_from_script_buf},
     wallet::{AssignmentsCollection, Indexer},
 };
 use crate::{

@@ -1544,7 +1544,7 @@ impl Wallet {
     /// The outputs spent within the consignment by its known transitions. The validation checks
     /// the inputs of a known transition, and the witness TX must close their seals, so only this
     /// wallet can spend an output paying it.
-    fn known_spent_opouts(consignment: &RgbTransfer) -> BTreeSet<Opout> {
+    pub(crate) fn known_spent_opouts(consignment: &RgbTransfer) -> BTreeSet<Opout> {
         consignment
             .bundles
             .iter()
@@ -6509,8 +6509,11 @@ impl Wallet {
             // one is failed below once its lock has expired
             let mut expired_batch_transfers: Vec<DbBatchTransfer> = vec![];
             let mut sent_mints = vec![];
+            // a prepared PSBT operation's batch is failed by its own sweep, which first checks
+            // that the indexer has not seen its TX
+            let psbt_op_batches = self.psbt_op_prepared_batch_idxs()?;
             for t in db_data.batch_transfers.clone() {
-                if !t.is_fallible() {
+                if !t.is_fallible() || psbt_op_batches.contains(&t.idx) {
                     continue;
                 }
                 let incoming = t.incoming(&db_data.asset_transfers, &db_data.transfers)?;
@@ -6560,6 +6563,9 @@ impl Wallet {
                         ),
                     }
                 }
+            }
+            if !no_asset_only {
+                transfers_changed |= self.psbt_op_sweep_expired().await?;
             }
         }
 

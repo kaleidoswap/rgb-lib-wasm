@@ -23,6 +23,16 @@ pub enum Error {
         asset_id: String,
     },
 
+    /// An outgoing batch transfer for the same TXID is already registered (fail or abort it
+    /// before preparing the same transaction again)
+    #[error("Outgoing batch transfer with idx {idx} already exists for TXID {txid}")]
+    BatchTransferAlreadyExists {
+        /// TXID shared by the conflicting batch transfer
+        txid: String,
+        /// Idx of the conflicting batch transfer
+        idx: i32,
+    },
+
     /// The requested batch transfer was not found
     #[error("Batch transfer with idx {idx} not found")]
     BatchTransferNotFound {
@@ -241,6 +251,15 @@ pub enum Error {
         available: u64,
     },
 
+    /// Witness TX does not yet meet the required confirmation count (retryable)
+    #[error("Insufficient confirmations: needed '{needed}', got '{got}'")]
+    InsufficientConfirmations {
+        /// Required confirmations (`min_confirmations`)
+        needed: u8,
+        /// Observed confirmations (`0` if unconfirmed)
+        got: u64,
+    },
+
     /// An internal error has been encountered
     #[error("Internal error: {details}")]
     Internal {
@@ -371,6 +390,13 @@ pub enum Error {
     /// The provided fee rate is invalid
     #[error("Invalid fee rate: {details}")]
     InvalidFeeRate {
+        /// Error details
+        details: String,
+    },
+
+    /// PSBT operation is not in the expected status for this call
+    #[error("Invalid HTLC operation status: {details}")]
+    InvalidPsbtOperationStatus {
         /// Error details
         details: String,
     },
@@ -602,6 +628,13 @@ pub enum Error {
     #[error("Output below the dust limit")]
     OutputBelowDustLimit,
 
+    /// PSBT operation not found
+    #[error("HTLC operation not found: {operation_id}")]
+    PsbtOperationNotFound {
+        /// Operation ID (or the TXID it was looked up by)
+        operation_id: String,
+    },
+
     /// Error contacting the RGB proxy
     #[error("Proxy error: {details}")]
     Proxy {
@@ -670,6 +703,13 @@ pub enum Error {
     #[error("Transfer ID in use")]
     TransferIDInUse,
 
+    /// Accepted transfer does not match the caller-provided expectation
+    #[error("Unexpected transfer: {details}")]
+    UnexpectedTransfer {
+        /// Error details
+        details: String,
+    },
+
     /// The detected RGB schema is unknown
     #[error("Unknown RGB schema: {schema_id}")]
     UnknownRgbSchema {
@@ -686,6 +726,13 @@ pub enum Error {
     UnknownTransfer {
         /// Transfer TXID
         txid: String,
+    },
+
+    /// The operation still relies on the RGB proxy protocol 0.2 and has not been ported to 1.0
+    #[error("Not supported yet with RGB proxy protocol 1.0: {operation}")]
+    NotSupportedYet {
+        /// The operation that was refused
+        operation: String,
     },
 
     /// The backup version is not supported
@@ -771,6 +818,13 @@ pub enum Error {
     WalletDirAlreadyExists {
         /// The directory path
         path: String,
+    },
+
+    /// Witness output cannot be pinned to the given recipient (mismatch or bad vout)
+    #[error("Witness output mismatch: {details}")]
+    WitnessOutputMismatch {
+        /// Error details
+        details: String,
     },
 
     /// The requested operation cannot be processed by a watch-only wallet
