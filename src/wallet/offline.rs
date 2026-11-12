@@ -4384,7 +4384,6 @@ pub(crate) fn swap_random_blinding() -> u64 {
 
 /// Derive a deterministic MPC entropy for a swap from its identifier. Both parties compute the
 /// same value so the MPC commitment they each (re)produce is identical.
-
 pub(crate) fn swap_mpc_entropy(swap_id: &str) -> u64 {
     let hash = hash_bytes_hex(swap_id.as_bytes());
     let mut bytes = [0u8; 8];
@@ -4542,7 +4541,6 @@ pub(crate) fn swap_validate_proxy_url(proxy_url: &Option<String>) -> Result<(), 
 /// Build the coloring for a swap RGB leg: `leg.amount` goes to `recipient_vout` and everything
 /// else the inputs carry (`available`, per contract) goes back to `change_vout`. Vouts are final
 /// PSBT indices; the returned flag tells whether the map was shifted for an OP_RETURN-first PSBT.
-
 pub(crate) fn swap_rgb_leg_coloring_info(
     leg: &OnchainSwapLeg,
     psbt: &Psbt,
@@ -4799,6 +4797,43 @@ pub(crate) fn swap_restore_input_metadata(
             .get_mut(idx)
             .ok_or_else(|| swap_invalid("PSBT input metadata mismatch"))?;
         psbt_input.witness_utxo = Some(swap_input_txout(input)?);
+    }
+    Ok(())
+}
+
+/// After signing, make sure this wallet added signatures only to the inputs it declared. A
+/// counterparty that smuggles one of this wallet's coins into the PSBT as its own input would
+/// otherwise have it spent. Signatures the counterparty already put on its own inputs stay.
+pub(crate) fn swap_ensure_only_own_inputs_signed(
+    before: &Psbt,
+    after: &Psbt,
+    own_inputs: &[OnchainSwapInput],
+) -> Result<(), Error> {
+    let own = own_inputs
+        .iter()
+        .map(swap_input_to_outpoint)
+        .collect::<HashSet<_>>();
+    for ((txin, was), now) in after
+        .unsigned_tx
+        .input
+        .iter()
+        .zip(before.inputs.iter())
+        .zip(after.inputs.iter())
+    {
+        if own.contains(&txin.previous_output) {
+            continue;
+        }
+        if was.partial_sigs != now.partial_sigs
+            || was.final_script_sig != now.final_script_sig
+            || was.final_script_witness != now.final_script_witness
+            || was.tap_key_sig != now.tap_key_sig
+            || was.tap_script_sigs != now.tap_script_sigs
+        {
+            return Err(swap_invalid(format!(
+                "signing the swap PSBT would sign {}, which is not one of this wallet's inputs",
+                txin.previous_output
+            )));
+        }
     }
     Ok(())
 }
@@ -5081,11 +5116,47 @@ mod swap_unit_tests {
     }
 
     #[test]
-    #[ignore = "reads the clock through js_sys, which only exists in a browser"]
+    fn only_the_declared_inputs_may_be_signed() {
+        let proposal = rgb_rgb_proposal();
+        let (unsigned, _, _) = swap_build_psbt(&proposal).unwrap();
+        let own = proposal.request.taker_inputs.clone();
+        let own_outpoint = swap_input_to_outpoint(&own[0]);
+        let own_idx = unsigned
+            .unsigned_tx
+            .input
+            .iter()
+            .position(|i| i.previous_output == own_outpoint)
+            .unwrap();
+        let other_idx = 1 - own_idx;
+
+        // nothing signed: fine
+        swap_ensure_only_own_inputs_signed(&unsigned, &unsigned, &own).unwrap();
+        // a signature on a declared input: fine
+        let mut signed = unsigned.clone();
+        signed.inputs[own_idx].final_script_witness = Some(Witness::new());
+        swap_ensure_only_own_inputs_signed(&unsigned, &signed, &own).unwrap();
+        // a signature the counterparty put on its own input before: fine, it is not ours
+        let mut counterparty_signed = unsigned.clone();
+        counterparty_signed.inputs[other_idx].final_script_witness = Some(Witness::new());
+        let mut both = counterparty_signed.clone();
+        both.inputs[own_idx].final_script_witness = Some(Witness::new());
+        swap_ensure_only_own_inputs_signed(&counterparty_signed, &both, &own).unwrap();
+        // a signature that appears on the counterparty's input while signing: refused
+        signed.inputs[other_idx].final_script_witness = Some(Witness::new());
+        let err = swap_ensure_only_own_inputs_signed(&unsigned, &signed, &own).unwrap_err();
+        assert!(
+            err.to_string().contains("not one of this wallet's inputs"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn rejects_expired_offer() {
         let mut proposal = rgb_rgb_proposal();
         proposal.request.offer.expiration_timestamp = Some(1);
         assert!(swap_ensure_not_expired(&proposal.request.offer).is_err());
+        proposal.request.offer.expiration_timestamp = Some(u64::MAX);
+        assert!(swap_ensure_not_expired(&proposal.request.offer).is_ok());
     }
 }
 
