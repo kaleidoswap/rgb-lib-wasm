@@ -193,8 +193,12 @@ impl super::Wallet {
             received_mints: payload.received_mints,
             rgb_store: payload.rgb_store,
             reuse_address_index: payload.reuse_address_index,
+            legacy_migration_error: None,
         };
-        self.restore_from_snapshot(snapshot)
+        self.restore_from_snapshot(snapshot)?;
+        // the backup replaces the state a failed 1.0.0-beta.3 migration left: do not retry it
+        self.legacy_migration = None;
+        Ok(())
     }
 
     /// Returns true if the wallet has been modified since the last backup.

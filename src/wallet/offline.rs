@@ -1312,6 +1312,8 @@ pub struct Wallet {
     pub(crate) rgb_stock: std::rc::Rc<std::cell::RefCell<Option<crate::utils::MemStock>>>,
     pub(crate) vss_client: Option<super::vss::VssBackupClient>,
     pub(crate) last_vss_backup_error: std::cell::RefCell<Option<String>>,
+    /// Outcome of the migration of the 1.0.0-beta.3 snapshot of this wallet, if one ran.
+    pub(crate) legacy_migration: Option<super::LegacyMigration>,
 }
 
 impl Wallet {
@@ -1320,20 +1322,124 @@ impl Wallet {
     /// The returned wallet is ready for use only after the IndexedDB read and snapshot
     /// restoration complete. IndexedDB and snapshot decoding failures are returned to the caller.
     /// It asks the browser to keep the storage. A refusal does not fail the call.
+    ///
+    /// When there is no snapshot, or the last migration of the 1.0.0-beta.3 snapshot failed, it
+    /// migrates the 1.0.0-beta.3 snapshot of the wallet, if there is one, and saves the result.
+    /// A failed migration does not fail the call: [`Wallet::legacy_migration`] returns it.
     pub async fn restore(wallet_data: WalletData) -> Result<Self, Error> {
         let mut wallet = Self::new(wallet_data)?;
         let snapshot = super::idb_store::load_snapshot(&wallet.idb_key())
             .await
             .map_err(|details| Error::Persistence { details })?;
+        let mut migrate = true;
         if let Some(snapshot) = snapshot {
+            migrate = snapshot.legacy_migration_error.is_some();
+            wallet.legacy_migration = snapshot
+                .legacy_migration_error
+                .clone()
+                .map(|error| super::LegacyMigration::Failed { error });
             wallet.idb_loaded = Some((snapshot.writer, snapshot.sequence));
             wallet
                 .idb_sequence
                 .store(snapshot.sequence, std::sync::atomic::Ordering::SeqCst);
             wallet.restore_from_snapshot(snapshot)?;
         }
+        if migrate
+            && let Some(legacy) = super::idb_store::load_raw(&wallet.legacy_idb_key())
+                .await
+                .map_err(|details| Error::Persistence { details })?
+            && wallet.migrate_legacy_snapshot(&legacy)
+        {
+            // the old snapshot stays in place: a crash before this write runs the migration
+            // again on the next open. A failed write stays in `last_save_error` and the next
+            // save writes the migrated state
+            if let Err(e) = wallet.flush().await {
+                error!(wallet.logger, "Cannot save the migrated snapshot: {e}");
+            }
+        }
         super::idb_store::request_persistent_storage();
         Ok(wallet)
+    }
+
+    /// Return the outcome of the migration of the 1.0.0-beta.3 snapshot of this wallet.
+    ///
+    /// `None` when no migration ran. A [`super::LegacyMigration::Failed`] migration leaves the
+    /// wallet without the RGB state of the 1.0.0-beta.3 snapshot: its RGB operations must not be
+    /// used until a migration succeeds.
+    pub fn legacy_migration(&self) -> Option<super::LegacyMigration> {
+        self.legacy_migration.clone()
+    }
+
+    /// Return the IndexedDB key 1.0.0-beta.3 saved this wallet under: its directory.
+    pub fn legacy_idb_key(&self) -> String {
+        self.wallet_dir.to_string_lossy().to_string()
+    }
+
+    /// Migrate the 1.0.0-beta.3 snapshot `json` of this wallet into its state, recording the
+    /// outcome in [`Wallet::legacy_migration`].
+    ///
+    /// Return whether the state changed. A snapshot of a wallet on another network changes
+    /// nothing. A snapshot that cannot be migrated changes nothing but the outcome.
+    pub(crate) fn migrate_legacy_snapshot(&mut self, json: &str) -> bool {
+        info!(self.logger, "Migrating the 1.0.0-beta.3 snapshot...");
+        let migrated = super::legacy_snapshot::migrate_legacy_snapshot(
+            json,
+            self.wallet_data.bitcoin_network,
+            &self.wallet_data.supported_schemas,
+            now().unix_timestamp(),
+        )
+        .and_then(|migrated| {
+            let Some(migrated) = migrated else {
+                return Ok(None);
+            };
+            let rgb_store = super::idb_store::serialize_stock(&migrated.stock)
+                .ok_or_else(|| s!("cannot serialize the RGB stock"))?;
+            Ok(Some(super::idb_store::WalletSnapshot {
+                writer: self.idb_writer,
+                sequence: 0,
+                db: migrated.db,
+                // the BDK wallet of this object is kept: the next full scan rebuilds it
+                bdk_changeset: None,
+                transfer_artifacts: HashMap::new(),
+                received_consignments: migrated.received_consignments,
+                received_consignment_meta: HashMap::new(),
+                received_signed_txs: HashMap::new(),
+                received_mints: HashMap::new(),
+                rgb_store,
+                reuse_address_index: migrated.reuse_address_index,
+                legacy_migration_error: None,
+            }))
+        })
+        .and_then(|snapshot| {
+            snapshot
+                .map(|snapshot| {
+                    self.restore_from_snapshot(snapshot)
+                        .map_err(|e| e.to_string())
+                })
+                .transpose()
+        });
+        match migrated {
+            Ok(None) => {
+                info!(
+                    self.logger,
+                    "The 1.0.0-beta.3 snapshot is of another network"
+                );
+                false
+            }
+            Ok(Some(())) => {
+                info!(self.logger, "Migrated the 1.0.0-beta.3 snapshot");
+                self.legacy_migration = Some(super::LegacyMigration::Migrated);
+                true
+            }
+            Err(error) => {
+                error!(
+                    self.logger,
+                    "Cannot migrate the 1.0.0-beta.3 snapshot: {error}"
+                );
+                self.legacy_migration = Some(super::LegacyMigration::Failed { error });
+                false
+            }
+        }
     }
 
     /// Create a new RGB wallet based on the provided [`WalletData`].
@@ -1475,6 +1581,7 @@ impl Wallet {
             },
             vss_client: None,
             last_vss_backup_error: std::cell::RefCell::new(None),
+            legacy_migration: None,
         })
     }
 
@@ -4024,6 +4131,10 @@ impl Wallet {
             received_mints: self.received_mints.clone(),
             rgb_store,
             reuse_address_index: self.reuse_address_index.clone(),
+            legacy_migration_error: match &self.legacy_migration {
+                Some(super::LegacyMigration::Failed { error }) => Some(error.clone()),
+                _ => None,
+            },
         })
     }
 
@@ -4215,6 +4326,7 @@ pub(crate) mod address_reuse_tests {
             rgb_stock: std::rc::Rc::new(std::cell::RefCell::new(None)),
             vss_client: None,
             last_vss_backup_error: std::cell::RefCell::new(None),
+            legacy_migration: None,
         }
     }
 
