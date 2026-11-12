@@ -645,6 +645,18 @@ pub struct InMemoryDb {
     psbt_ops: RefCell<Vec<DbPsbtOp>>,
     #[serde(default = "first_idx")]
     next_psbt_op_idx: RefCell<i32>,
+    // absent from snapshots taken before out-of-band sends were supported
+    #[serde(default)]
+    out_of_band_consignments: RefCell<Vec<DbOutOfBandConsignment>>,
+}
+
+/// The consignment of an out-of-band send, kept for the counterparty: no proxy carries it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DbOutOfBandConsignment {
+    pub(crate) txid: String,
+    pub(crate) asset_id: String,
+    /// Base64 of the consignment bytes.
+    pub(crate) consignment: String,
 }
 
 fn first_idx() -> RefCell<i32> {
@@ -682,7 +694,33 @@ impl InMemoryDb {
             next_swap_idx: RefCell::new(1),
             psbt_ops: RefCell::new(Vec::new()),
             next_psbt_op_idx: RefCell::new(1),
+            out_of_band_consignments: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Keep the consignment of an out-of-band send, replacing an earlier one.
+    pub(crate) fn set_out_of_band_consignment(
+        &self,
+        txid: &str,
+        asset_id: &str,
+        consignment: String,
+    ) {
+        let mut rows = self.out_of_band_consignments.borrow_mut();
+        rows.retain(|r| !(r.txid == txid && r.asset_id == asset_id));
+        rows.push(DbOutOfBandConsignment {
+            txid: txid.to_owned(),
+            asset_id: asset_id.to_owned(),
+            consignment,
+        });
+    }
+
+    /// The base64 consignment of an out-of-band send.
+    pub(crate) fn get_out_of_band_consignment(&self, txid: &str, asset_id: &str) -> Option<String> {
+        self.out_of_band_consignments
+            .borrow()
+            .iter()
+            .find(|r| r.txid == txid && r.asset_id == asset_id)
+            .map(|r| r.consignment.clone())
     }
 
     pub(crate) fn set_asset(&self, a: DbAssetActMod) -> Result<i32, InternalError> {

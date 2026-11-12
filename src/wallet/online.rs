@@ -6586,7 +6586,10 @@ impl Wallet {
         recipient_vout: &mut u32,
         mint: bool,
     ) -> Result<LocalRecipient, Error> {
-        self.check_transport_endpoints(&recipient.transport_endpoints)?;
+        let out_of_band = recipient.transport_endpoints.is_empty() && !mint;
+        if !out_of_band {
+            self.check_transport_endpoints(&recipient.transport_endpoints)?;
+        }
         match (&recipient.assignment, schema) {
             (Assignment::Fungible(amt), AssetSchema::Nia | AssetSchema::Ifa | AssetSchema::Bfa) => {
                 if *amt == 0 {
@@ -6602,6 +6605,14 @@ impl Wallet {
             _ => {
                 return Err(Error::InvalidAssignment);
             }
+        }
+        if out_of_band {
+            return Self::out_of_band_recipient(
+                recipient,
+                chainnet,
+                witness_recipients,
+                recipient_vout,
+            );
         }
         let mut transport_endpoints: Vec<LocalTransportEndpoint> = vec![];
         let mut found_valid = false;
@@ -6722,6 +6733,57 @@ impl Wallet {
         })
     }
 
+    /// A recipient with no transport endpoint: no proxy, so no invoice key, no invoice expiration
+    /// and no derived blinding. A witness recipient takes the blinding the caller gives, as the
+    /// counterparty needs it to find the seal (e.g. the blinding of an HTLC lock).
+    pub(crate) fn out_of_band_recipient(
+        recipient: &Recipient,
+        chainnet: ChainNet,
+        witness_recipients: &mut Vec<(ScriptBuf, u64)>,
+        recipient_vout: &mut u32,
+    ) -> Result<LocalRecipient, Error> {
+        let xchainnet_beneficiary = XChainNet::<Beneficiary>::from_str(&recipient.recipient_id)
+            .map_err(|_| Error::InvalidRecipientID)?;
+        if xchainnet_beneficiary.chain_network() != chainnet {
+            return Err(Error::InvalidRecipientNetwork);
+        }
+        let local_recipient_data =
+            match xchainnet_beneficiary.into_inner() {
+                Beneficiary::BlindedSeal(secret_seal) => {
+                    if recipient.witness_data.is_some() {
+                        return Err(Error::InvalidRecipientData {
+                            details: s!("cannot provide witness data for a blinded recipient"),
+                        });
+                    }
+                    LocalRecipientData::Blind(secret_seal)
+                }
+                Beneficiary::WitnessVout(pay_2_vout, _) => {
+                    let witness_data = recipient.witness_data.as_ref().ok_or_else(|| {
+                        Error::InvalidRecipientData {
+                            details: s!("missing witness data for a witness recipient"),
+                        }
+                    })?;
+                    witness_recipients.push((pay_2_vout.to_script(), witness_data.amount_sat));
+                    let local_witness_data = LocalWitnessData {
+                        amount_sat: witness_data.amount_sat,
+                        blinding: witness_data.blinding,
+                        vout: *recipient_vout,
+                    };
+                    *recipient_vout += 1;
+                    LocalRecipientData::Witness(local_witness_data)
+                }
+            };
+        Ok(LocalRecipient {
+            recipient_id: recipient.recipient_id.clone(),
+            local_recipient_data,
+            assignment: recipient.assignment.clone(),
+            transport_endpoints: vec![],
+            public_key: vec![],
+            encryption: recipient.encryption,
+            invoice_expiration: None,
+        })
+    }
+
     /// Prepare the PSBT to send RGB assets (wasm32 async).
     ///
     /// See native [`send_begin`](Wallet::send_begin) for full documentation.
@@ -6752,13 +6814,39 @@ impl Wallet {
         if recipient_map.is_empty() || recipient_map.values().any(|v| v.is_empty()) {
             return Err(Error::InvalidRecipientMap);
         }
-        // the recipients post their ACK to (and get the signed TX from) the sender proxy
-        let Some(sender_transport_endpoint) = sender_transport_endpoint else {
-            return Err(Error::InvalidTransportEndpoint {
-                details: s!("missing sender transport endpoint"),
+        // an out-of-band send (no recipient names a transport endpoint) is a donation whose
+        // consignments the caller hands over itself: no proxy is involved
+        let out_of_band = recipient_map
+            .values()
+            .flatten()
+            .all(|r| r.transport_endpoints.is_empty());
+        if !out_of_band
+            && recipient_map
+                .values()
+                .flatten()
+                .any(|r| r.transport_endpoints.is_empty())
+        {
+            return Err(Error::InvalidTransportEndpoints {
+                details: s!("cannot mix out-of-band and proxy recipients"),
             });
+        }
+        if out_of_band && !donation {
+            return Err(Error::InvalidRecipientData {
+                details: s!("an out-of-band send must be a donation"),
+            });
+        }
+        // the recipients post their ACK to (and get the signed TX from) the sender proxy
+        let sender_transport_endpoint = if out_of_band {
+            None
+        } else {
+            let Some(endpoint) = sender_transport_endpoint else {
+                return Err(Error::InvalidTransportEndpoint {
+                    details: s!("missing sender transport endpoint"),
+                });
+            };
+            self.convert_transport_endpoint_url(&endpoint)?;
+            Some(endpoint)
         };
-        self.convert_transport_endpoint_url(&sender_transport_endpoint)?;
         let operation_sk = crate::encryption::gen_ed25519();
         let operation_secret_key = operation_sk.to_bytes().to_vec();
         let now_ts = now().unix_timestamp();
@@ -6793,13 +6881,13 @@ impl Wallet {
                         false,
                     )
                     .await?;
-                let invoice_expiration = local_recipient
-                    .invoice_expiration
-                    .expect("set by _parse_recipient");
-                min_invoice_expiration = Some(
-                    min_invoice_expiration
-                        .map_or(invoice_expiration, |m| std::cmp::min(m, invoice_expiration)),
-                );
+                // an out-of-band recipient has no invoice to bound the operation
+                if let Some(invoice_expiration) = local_recipient.invoice_expiration {
+                    min_invoice_expiration = Some(
+                        min_invoice_expiration
+                            .map_or(invoice_expiration, |m| std::cmp::min(m, invoice_expiration)),
+                    );
+                }
                 local_recipients
                     .entry(asset_id.clone())
                     .or_default()
@@ -6896,7 +6984,10 @@ impl Wallet {
             if !invoices_checked {
                 invoices_checked = true;
                 for recipients in local_recipients.values() {
-                    for lr in recipients {
+                    for lr in recipients
+                        .iter()
+                        .filter(|lr| !lr.transport_endpoints.is_empty())
+                    {
                         let (invoice_id, _) = lr.proxy_ids("");
                         let mut full = false;
                         let mut unknown = false;
@@ -6949,7 +7040,7 @@ impl Wallet {
                     Some(expiration_timestamp as i64),
                     lock_time,
                     Some(operation_secret_key.clone()),
-                    Some(sender_transport_endpoint.clone()),
+                    sender_transport_endpoint.clone(),
                     &mut runtime,
                     &mut rejected,
                     &mut reject_lists,
@@ -7058,7 +7149,11 @@ impl Wallet {
         consignment_hash: &str,
         batch: bool,
     ) -> Result<(), Error> {
-        for recipient in recipients {
+        // an out-of-band recipient gets its consignment from the caller
+        for recipient in recipients
+            .iter_mut()
+            .filter(|r| !r.transport_endpoints.is_empty())
+        {
             let recipient_id = &recipient.recipient_id;
             let recipient_vk = verifying_key_from_bytes(&recipient.public_key)?;
             let derived = derive_shared(sender_sk, &recipient_vk)?;
@@ -7220,12 +7315,17 @@ impl Wallet {
             })?;
         let sender_sk = ed25519_from_seed(&seed);
         let sender_pubkey_hex = hex::encode(sender_sk.verifying_key().to_bytes());
-        let sender_transport_endpoint = info_contents
-            .sender_transport_endpoint
-            .clone()
-            .ok_or_else(|| Error::Internal {
-                details: s!("missing sender transport endpoint"),
-            })?;
+        // `None` for an out-of-band send, which posts nothing
+        let sender_transport_endpoint = info_contents.sender_transport_endpoint.clone();
+        if sender_transport_endpoint.is_none() {
+            for (asset_id, bytes) in &consignment_bytes {
+                self.database.set_out_of_band_consignment(
+                    &txid,
+                    asset_id,
+                    general_purpose::STANDARD.encode(bytes),
+                );
+            }
+        }
 
         let total_recipients: usize = asset_infos.values().map(|t| t.recipients.len()).sum();
         let batch = total_recipients > 1;
@@ -7244,10 +7344,17 @@ impl Wallet {
         // whether the operation was registered earlier and has expired since, so there is nothing
         // left to post
         let mut operation_expired = false;
-        let sender_proxy_url = self.convert_transport_endpoint_url(&sender_transport_endpoint)?;
         // ACK preparation on the sender's own proxy (non-donation only), before posting
         // consignments
         if !info_contents.donation {
+            let sender_transport_endpoint =
+                sender_transport_endpoint
+                    .as_deref()
+                    .ok_or_else(|| Error::Internal {
+                        details: s!("missing sender transport endpoint"),
+                    })?;
+            let sender_proxy_url =
+                self.convert_transport_endpoint_url(sender_transport_endpoint)?;
             let mut transfer_data: HashMap<String, AckTransferData> = HashMap::new();
             for (asset_id, info_asset) in &asset_infos {
                 let consignment_hash = consignment_hashes[asset_id].clone();
@@ -7331,7 +7438,7 @@ impl Wallet {
                         &consignment_bytes[asset_id],
                         &sender_sk,
                         &sender_pubkey_hex,
-                        &sender_transport_endpoint,
+                        sender_transport_endpoint.as_deref().unwrap_or_default(),
                         &consignment_hashes[asset_id],
                         batch,
                     )

@@ -174,19 +174,35 @@ pub struct ExpectedTransfer {
     pub assignment: Assignment,
 }
 
-/// A consignment fetched from a proxy, before any validation.
+/// A consignment received from the counterparty out of band, before any validation.
 ///
-/// **Unchecked:** `txid` and `vout` are what the proxy reported. Pass it to
+/// **Unchecked:** `txid` and `vout` are what the counterparty declared. Pass it to
 /// [`Wallet::accept_transfer_pinned`], which pins the witness output before accepting.
 #[cfg(feature = "esplora")]
 #[derive(Debug, Clone)]
 pub struct FetchedConsignment {
     /// The consignment.
     pub consignment: RgbTransfer,
-    /// Witness transaction ID reported by the proxy.
+    /// Witness transaction ID declared by the counterparty.
     pub txid: String,
-    /// Witness output reported by the proxy.
+    /// Witness output declared by the counterparty.
     pub vout: u32,
+}
+
+#[cfg(feature = "esplora")]
+impl FetchedConsignment {
+    /// Decode a base64-encoded transfer consignment.
+    pub fn from_base64(consignment: &str, txid: String, vout: u32) -> Result<Self, Error> {
+        let bytes = general_purpose::STANDARD
+            .decode(consignment)
+            .map_err(|_| Error::InvalidConsignment)?;
+        let consignment = RgbTransfer::load(&bytes[..]).map_err(|_| Error::InvalidConsignment)?;
+        Ok(Self {
+            consignment,
+            txid,
+            vout,
+        })
+    }
 }
 
 /// Result of [`Wallet::accept_transfer_pinned`].
@@ -1030,6 +1046,17 @@ impl Wallet {
         let transfer_dir = self.get_transfer_dir(transfer_id);
         let asset_transfer_dir = self.get_asset_transfer_dir(transfer_dir, asset_id);
         asset_transfer_dir.join(CONSIGNMENT_FILE)
+    }
+
+    /// The base64 consignment of an out-of-band send of `asset_id` committed by `txid`, for the
+    /// caller to hand to the counterparty (e.g. the lock of an HTLC). Kept once
+    /// [`Wallet::send_end`] completes, as no proxy carries it.
+    pub fn get_out_of_band_consignment(&self, txid: &str, asset_id: &str) -> Result<String, Error> {
+        self.database
+            .get_out_of_band_consignment(txid, asset_id)
+            .ok_or_else(|| Error::UnknownTransfer {
+                txid: txid.to_string(),
+            })
     }
 
     /// The consignment bytes of a pending send, for tests.
@@ -1996,57 +2023,41 @@ impl Wallet {
         })
     }
 
-    /// Fetch an RGB consignment by recipient ID (proxy lookup key).
+    /// Accept an HTLC consignment received from the counterparty, pinning its witness output.
     ///
-    /// Not supported yet: RGB proxy protocol 1.0 has no lookup by recipient ID. Always returns
-    /// [`Error::NotSupportedYet`]; accept a consignment obtained otherwise with
-    /// [`Self::accept_transfer_pinned`].
-    ///
-    /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
-    pub async fn fetch_consignment_by_recipient_id_unchecked(
-        &self,
-        recipient_id: String,
-        consignment_endpoint: &str,
-    ) -> Result<FetchedConsignment, Error> {
-        let _ = (recipient_id, consignment_endpoint);
-        Err(Error::NotSupportedYet {
-            operation: s!("fetch_consignment_by_recipient_id_unchecked"),
-        })
-    }
-
-    /// Fetch a consignment by proxy key, pin the witness output to `witness_recipient_id`, and
-    /// accept the transfer.
-    ///
-    /// Not supported yet, see [`Self::fetch_consignment_by_recipient_id_unchecked`]. Always
-    /// returns [`Error::NotSupportedYet`].
+    /// `consignment` is the base64-encoded transfer consignment, exchanged out of band (proxy
+    /// protocol 1.0 has no lookup by recipient ID). Decodes it and calls
+    /// [`Self::accept_transfer_pinned`], whose checks and errors apply.
     ///
     /// <div class="warning">This method is meant for special usage on HTLC outpoints</div>
     #[allow(clippy::too_many_arguments)]
-    pub async fn fetch_and_accept_transfer_by_recipient_id(
+    pub async fn accept_htlc_consignment(
         &mut self,
         online: Online,
-        proxy_recipient_id: String,
+        consignment: &str,
+        txid: String,
+        vout: u32,
         witness_recipient_id: String,
-        consignment_endpoint: &str,
         blinding: u64,
         min_confirmations: u8,
         expected: ExpectedTransfer,
     ) -> Result<(RgbTransfer, Vec<Assignment>), Error> {
-        self.check_online(online)?;
-        let _ = (
-            proxy_recipient_id,
-            witness_recipient_id,
-            consignment_endpoint,
-            blinding,
-            min_confirmations,
-            expected,
-        );
-        Err(Error::NotSupportedYet {
-            operation: s!("fetch_and_accept_transfer_by_recipient_id"),
-        })
+        self.check_online(online.clone())?;
+        let fetched = FetchedConsignment::from_base64(consignment, txid, vout)?;
+        let accepted = self
+            .accept_transfer_pinned(
+                online,
+                fetched,
+                witness_recipient_id,
+                blinding,
+                min_confirmations,
+                expected,
+            )
+            .await?;
+        Ok((accepted.consignment, accepted.assignments))
     }
 
-    /// Accept a consignment fetched with [`Self::fetch_consignment_by_recipient_id_unchecked`]:
+    /// Accept a consignment received from the counterparty ([`FetchedConsignment`]):
     /// pin `output[vout]` of the witness transaction to `witness_recipient_id` with at least
     /// `min_confirmations` (else [`Error::InsufficientConfirmations`]), require that output to be
     /// unspent, check the transfer matches `expected`, and accept it.
@@ -3129,5 +3140,144 @@ mod psbt_op_tests {
         assert_eq!(parsed, PsbtOpExpiry::Never);
         let parsed: PsbtOpExpiry = serde_json::from_str("{\"at\":9}").unwrap();
         assert_eq!(parsed, PsbtOpExpiry::At(9));
+    }
+
+    fn oob_recipient(recipient_id: String, blinding: Option<u64>) -> Recipient {
+        Recipient {
+            recipient_id,
+            witness_data: Some(WitnessData {
+                amount_sat: 1_000,
+                blinding,
+            }),
+            assignment: Assignment::Fungible(AMOUNT),
+            transport_endpoints: vec![],
+            public_key: None,
+            encryption: Encryption::Unsupported,
+            expiration_timestamp: None,
+        }
+    }
+
+    #[test]
+    fn an_htlc_consignment_that_is_not_base64_is_refused() {
+        let mut wallet = test_wallet();
+        let expected = ExpectedTransfer {
+            asset_id: s!("rgb:x"),
+            asset_schema: AssetSchema::Nia,
+            assignment: Assignment::Fungible(AMOUNT),
+        };
+        for bad in ["not base64!", "bm90IGEgY29uc2lnbm1lbnQ="] {
+            assert!(matches!(
+                block_on(wallet.accept_htlc_consignment(
+                    online(),
+                    bad,
+                    FOREIGN_TXID.to_string(),
+                    0,
+                    s!("bcrt:wvout:x"),
+                    BLINDING,
+                    1,
+                    expected.clone(),
+                )),
+                Err(Error::InvalidConsignment)
+            ));
+        }
+    }
+
+    #[test]
+    fn an_out_of_band_recipient_keeps_its_blinding_and_needs_no_proxy() {
+        let script = ScriptBuf::new_p2tr_tweaked(
+            bdk_wallet::bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
+                bdk_wallet::bitcoin::XOnlyPublicKey::from_slice(&[2; 32]).unwrap(),
+            ),
+        );
+        let recipient_id =
+            crate::utils::recipient_id_from_script_buf(script.clone(), BitcoinNetwork::Regtest);
+        let chainnet: ChainNet = BitcoinNetwork::Regtest.into();
+        let mut witness = vec![];
+        let mut vout = 1;
+        let local = Wallet::out_of_band_recipient(
+            &oob_recipient(recipient_id.clone(), Some(BLINDING)),
+            chainnet,
+            &mut witness,
+            &mut vout,
+        )
+        .unwrap();
+        assert!(local.transport_endpoints.is_empty() && local.public_key.is_empty());
+        assert_eq!(local.invoice_expiration, None);
+        match local.local_recipient_data {
+            LocalRecipientData::Witness(w) => {
+                assert_eq!(w.blinding, Some(BLINDING), "the caller's blinding");
+                assert_eq!(w.vout, 1);
+            }
+            other => panic!("a witness recipient, got {other:?}"),
+        }
+        assert_eq!(witness, vec![(script, 1_000)]);
+        assert_eq!(vout, 2);
+
+        let mut no_witness = oob_recipient(recipient_id.clone(), None);
+        no_witness.witness_data = None;
+        assert!(matches!(
+            Wallet::out_of_band_recipient(&no_witness, chainnet, &mut vec![], &mut 1),
+            Err(Error::InvalidRecipientData { .. })
+        ));
+        let mainnet: ChainNet = BitcoinNetwork::Mainnet.into();
+        assert!(matches!(
+            Wallet::out_of_band_recipient(
+                &oob_recipient(recipient_id, None),
+                mainnet,
+                &mut vec![],
+                &mut 1
+            ),
+            Err(Error::InvalidRecipientNetwork)
+        ));
+    }
+
+    #[test]
+    fn an_out_of_band_send_is_a_donation_and_never_mixes_with_proxies() {
+        let mut wallet = test_wallet();
+        let oob = oob_recipient(s!("bcrt:wvout:a"), Some(BLINDING));
+        let mut proxied = oob.clone();
+        proxied.transport_endpoints = vec![s!("rpc://127.0.0.1:1/json-rpc")];
+        let send = |wallet: &mut Wallet, recipients: Vec<Recipient>, donation: bool| {
+            block_on(wallet.send_begin(
+                online(),
+                HashMap::from([(s!("rgb:x"), recipients)]),
+                donation,
+                2,
+                1,
+                now().unix_timestamp() as u64 + 3_600,
+                None,
+                None,
+                true,
+            ))
+        };
+        assert!(matches!(
+            send(&mut wallet, vec![oob.clone()], false),
+            Err(Error::InvalidRecipientData { .. })
+        ));
+        assert!(matches!(
+            send(&mut wallet, vec![oob, proxied], true),
+            Err(Error::InvalidTransportEndpoints { .. })
+        ));
+    }
+
+    #[test]
+    fn an_out_of_band_consignment_is_kept_for_the_counterparty() {
+        let wallet = test_wallet();
+        assert!(matches!(
+            wallet.get_out_of_band_consignment(FOREIGN_TXID, "rgb:x"),
+            Err(Error::UnknownTransfer { .. })
+        ));
+        wallet
+            .database
+            .set_out_of_band_consignment(FOREIGN_TXID, "rgb:x", s!("first"));
+        wallet
+            .database
+            .set_out_of_band_consignment(FOREIGN_TXID, "rgb:x", s!("second"));
+        assert_eq!(
+            wallet
+                .get_out_of_band_consignment(FOREIGN_TXID, "rgb:x")
+                .unwrap(),
+            "second"
+        );
     }
 }

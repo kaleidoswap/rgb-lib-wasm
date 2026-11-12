@@ -1387,17 +1387,20 @@ impl WasmWallet {
 
 #[wasm_bindgen]
 impl WasmWallet {
-    /// Fetch a consignment by proxy recipient ID and accept it. Not supported yet with RGB proxy
-    /// protocol 1.0: always rejects. Use `acceptTransferPinned` with a consignment obtained
-    /// otherwise.
-    #[wasm_bindgen(js_name = "fetchAndAcceptTransferByRecipientId")]
+    /// Accept an HTLC lock consignment (base64) received out of band, whose witness output
+    /// `txid:vout` must pay `witnessRecipientId` with at least `minConfirmations`, if it matches
+    /// `expected` (`{ assetId, assetSchema: "Nia", assignment: { Fungible: n } }`). `blinding` is a
+    /// decimal string, a BigInt or a safe Number. Returns `{ consignment: <hex>, assignments }`.
+    /// Rejects with "Insufficient confirmations: ..." while the witness is too shallow.
+    #[wasm_bindgen(js_name = "acceptHtlcConsignment")]
     #[allow(clippy::too_many_arguments)]
-    pub async fn fetch_and_accept_transfer_by_recipient_id(
+    pub async fn accept_htlc_consignment(
         &self,
         online_js: JsValue,
-        proxy_recipient_id: String,
+        consignment_base64: String,
+        txid: String,
+        vout: u32,
         witness_recipient_id: String,
-        consignment_endpoint: String,
         blinding_js: JsValue,
         min_confirmations: u8,
         expected_js: JsValue,
@@ -1408,11 +1411,12 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&format!("Invalid expected transfer: {e}")))?;
         let mut wallet = self.inner.borrow_mut();
         let (consignment, assignments) = wallet
-            .fetch_and_accept_transfer_by_recipient_id(
+            .accept_htlc_consignment(
                 online,
-                proxy_recipient_id,
+                &consignment_base64,
+                txid,
+                vout,
                 witness_recipient_id,
-                &consignment_endpoint,
                 blinding,
                 min_confirmations,
                 expected,
@@ -1423,6 +1427,20 @@ impl WasmWallet {
             consignment: consignment_to_hex(&consignment)?,
             assignments,
         })
+    }
+
+    /// The base64 consignment of an out-of-band send (a donation `send` whose recipients name no
+    /// transport endpoint) of `assetId` committed by `txid`, to hand to the counterparty.
+    #[wasm_bindgen(js_name = "getOutOfBandConsignment")]
+    pub fn get_out_of_band_consignment(
+        &self,
+        txid: String,
+        asset_id: String,
+    ) -> Result<String, JsValue> {
+        self.inner
+            .borrow()
+            .get_out_of_band_consignment(&txid, &asset_id)
+            .map_err(js_err)
     }
 
     /// Accept a consignment (hex) whose witness output `txid:vout` must pay `witnessRecipientId`
