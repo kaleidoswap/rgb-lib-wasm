@@ -7319,10 +7319,25 @@ impl Wallet {
         let sender_transport_endpoint = info_contents.sender_transport_endpoint.clone();
         if sender_transport_endpoint.is_none() {
             for (asset_id, bytes) in &consignment_bytes {
+                let recipient_vouts = asset_infos
+                    .get(asset_id)
+                    .map(|info| {
+                        info.recipients
+                            .iter()
+                            .filter_map(|r| match &r.local_recipient_data {
+                                LocalRecipientData::Witness(w) => {
+                                    Some((r.recipient_id.clone(), w.vout))
+                                }
+                                LocalRecipientData::Blind(_) => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 self.database.set_out_of_band_consignment(
                     &txid,
                     asset_id,
                     general_purpose::STANDARD.encode(bytes),
+                    recipient_vouts,
                 );
             }
         }

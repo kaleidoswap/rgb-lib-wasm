@@ -657,6 +657,9 @@ pub(crate) struct DbOutOfBandConsignment {
     pub(crate) asset_id: String,
     /// Base64 of the consignment bytes.
     pub(crate) consignment: String,
+    /// The output each witness recipient is paid on.
+    #[serde(default)]
+    pub(crate) recipient_vouts: Vec<(String, u32)>,
 }
 
 fn first_idx() -> RefCell<i32> {
@@ -704,6 +707,7 @@ impl InMemoryDb {
         txid: &str,
         asset_id: &str,
         consignment: String,
+        recipient_vouts: Vec<(String, u32)>,
     ) {
         let mut rows = self.out_of_band_consignments.borrow_mut();
         rows.retain(|r| !(r.txid == txid && r.asset_id == asset_id));
@@ -711,7 +715,21 @@ impl InMemoryDb {
             txid: txid.to_owned(),
             asset_id: asset_id.to_owned(),
             consignment,
+            recipient_vouts,
         });
+    }
+
+    /// The out-of-band send of `asset_id` committed by `txid`.
+    pub(crate) fn get_out_of_band_transfer(
+        &self,
+        txid: &str,
+        asset_id: &str,
+    ) -> Option<DbOutOfBandConsignment> {
+        self.out_of_band_consignments
+            .borrow()
+            .iter()
+            .find(|r| r.txid == txid && r.asset_id == asset_id)
+            .cloned()
     }
 
     /// The base64 consignment of an out-of-band send.

@@ -205,6 +205,28 @@ impl FetchedConsignment {
     }
 }
 
+/// An out-of-band send, see [`Wallet::get_out_of_band_transfer`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct OutOfBandTransfer {
+    /// The consignment, base64.
+    pub consignment: String,
+    /// The transaction committing the transfer.
+    pub txid: String,
+    /// The witness recipients and the outputs they are paid on.
+    pub recipients: Vec<OutOfBandRecipient>,
+}
+
+/// A witness recipient of an out-of-band send and the output it is paid on.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct OutOfBandRecipient {
+    /// The recipient ID.
+    pub recipient_id: String,
+    /// The output paying it.
+    pub vout: u32,
+}
+
 /// Result of [`Wallet::accept_transfer_pinned`].
 #[cfg(feature = "esplora")]
 #[derive(Debug, Clone)]
@@ -1057,6 +1079,30 @@ impl Wallet {
             .ok_or_else(|| Error::UnknownTransfer {
                 txid: txid.to_string(),
             })
+    }
+
+    /// An out-of-band send of `asset_id` committed by `txid`: its base64 consignment and the
+    /// output each witness recipient is paid on, for the caller to hand to the counterparty.
+    pub fn get_out_of_band_transfer(
+        &self,
+        txid: &str,
+        asset_id: &str,
+    ) -> Result<OutOfBandTransfer, Error> {
+        let row = self
+            .database
+            .get_out_of_band_transfer(txid, asset_id)
+            .ok_or_else(|| Error::UnknownTransfer {
+                txid: txid.to_string(),
+            })?;
+        Ok(OutOfBandTransfer {
+            consignment: row.consignment,
+            txid: row.txid,
+            recipients: row
+                .recipient_vouts
+                .into_iter()
+                .map(|(recipient_id, vout)| OutOfBandRecipient { recipient_id, vout })
+                .collect(),
+        })
     }
 
     /// The consignment bytes of a pending send, for tests.
@@ -3316,15 +3362,31 @@ mod psbt_op_tests {
         ));
         wallet
             .database
-            .set_out_of_band_consignment(FOREIGN_TXID, "rgb:x", s!("first"));
-        wallet
-            .database
-            .set_out_of_band_consignment(FOREIGN_TXID, "rgb:x", s!("second"));
+            .set_out_of_band_consignment(FOREIGN_TXID, "rgb:x", s!("first"), vec![]);
+        wallet.database.set_out_of_band_consignment(
+            FOREIGN_TXID,
+            "rgb:x",
+            s!("second"),
+            vec![(s!("bcrt:wvout:a"), 1)],
+        );
         assert_eq!(
             wallet
                 .get_out_of_band_consignment(FOREIGN_TXID, "rgb:x")
                 .unwrap(),
             "second"
+        );
+        assert_eq!(
+            wallet
+                .get_out_of_band_transfer(FOREIGN_TXID, "rgb:x")
+                .unwrap(),
+            OutOfBandTransfer {
+                consignment: s!("second"),
+                txid: FOREIGN_TXID.to_string(),
+                recipients: vec![OutOfBandRecipient {
+                    recipient_id: s!("bcrt:wvout:a"),
+                    vout: 1,
+                }],
+            }
         );
     }
 }

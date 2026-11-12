@@ -570,6 +570,15 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    /// Return a new address of the colored keychain, e.g. to pay an HTLC claim to.
+    #[wasm_bindgen(js_name = "getColoredAddress")]
+    pub fn get_colored_address(&self) -> Result<String, JsValue> {
+        self.inner
+            .borrow_mut()
+            .get_colored_address()
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Rotate the pinned address for the given keychain.
     /// keychain: 0 = External (colored), 1 = Internal (vanilla)
     #[wasm_bindgen(js_name = "rotateAddress")]
@@ -1431,8 +1440,24 @@ impl WasmWallet {
         })
     }
 
-    /// The base64 consignment of an out-of-band send (a donation `send` whose recipients name no
-    /// transport endpoint) of `assetId` committed by `txid`, to hand to the counterparty.
+    /// An out-of-band send (a donation `send` whose recipients name no transport endpoint) of
+    /// `assetId` committed by `txid`: `{ consignment, txid, recipients: [{ recipientId, vout }] }`,
+    /// consignment base64, to hand to the counterparty.
+    #[wasm_bindgen(js_name = "getOutOfBandTransfer")]
+    pub fn get_out_of_band_transfer(
+        &self,
+        txid: String,
+        asset_id: String,
+    ) -> Result<JsValue, JsValue> {
+        let transfer = self
+            .inner
+            .borrow()
+            .get_out_of_band_transfer(&txid, &asset_id)
+            .map_err(js_err)?;
+        to_js(&transfer)
+    }
+
+    /// The base64 consignment of an out-of-band send, see `getOutOfBandTransfer`.
     #[wasm_bindgen(js_name = "getOutOfBandConsignment")]
     pub fn get_out_of_band_consignment(
         &self,
@@ -1686,6 +1711,22 @@ pub fn script_buf_from_recipient_id(recipient_id: &str) -> Result<Option<String>
     rgb_lib_wasm::utils::script_buf_from_recipient_id(recipient_id.to_string())
         .map(|script| script.map(|s| s.to_hex_string()))
         .map_err(js_err)
+}
+
+/// The witness recipient ID of an output script (hex) on `bitcoinNetwork`.
+#[wasm_bindgen(js_name = "recipientIdFromScriptBuf")]
+pub fn recipient_id_from_script_buf(
+    script_hex: &str,
+    bitcoin_network: &str,
+) -> Result<String, JsValue> {
+    let network = bitcoin_network
+        .parse::<rgb_lib_wasm::BitcoinNetwork>()
+        .map_err(js_err)?;
+    let script = rgb_lib_wasm::bitcoin::ScriptBuf::from_hex(script_hex)
+        .map_err(|e| JsValue::from_str(&format!("Invalid script: {e}")))?;
+    Ok(rgb_lib_wasm::utils::recipient_id_from_script_buf(
+        script, network,
+    ))
 }
 
 /// Check whether the provided URL points to a valid RGB proxy server.

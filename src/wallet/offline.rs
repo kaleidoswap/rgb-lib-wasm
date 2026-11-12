@@ -4100,6 +4100,17 @@ impl Wallet {
         self._get_new_address(KeychainKind::External)
     }
 
+    /// Return a new address of the colored keychain, e.g. to pay an HTLC claim to: an RGB
+    /// allocation on it is tracked as the wallet's own, with no receive.
+    pub fn get_colored_address(&mut self) -> Result<String, Error> {
+        let address = self._get_new_address(KeychainKind::External)?;
+        if !self.wallet_data.reuse_addresses {
+            self.update_backup_info(false)?;
+        }
+        self.queue_save()?;
+        Ok(address.to_string())
+    }
+
     /// Return a new Bitcoin address from the vanilla wallet.
     pub fn get_address(&mut self) -> Result<String, Error> {
         info!(self.logger, "Getting address...");
