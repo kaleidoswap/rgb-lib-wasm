@@ -88,6 +88,7 @@ rgb-invoicing = { version = "=0.11.2-rc.1", default-features = false }
 rgb-psbt-utils = { version = "=0.11.2-rc.1", default-features = false }
 rgb-schemas = { version = "=0.11.2-rc.1", default-features = false }
 rgb-ops = { version = "=0.11.2-rc.1", default-features = false, features = [
+    "legacy",
     "serde",
 ] }
 rgb-strict-encoding = { version = "=1.0.5", default-features = false, features = [
