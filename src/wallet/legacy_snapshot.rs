@@ -512,3 +512,344 @@ fn migrate_db(db: Value, now: i64) -> Result<InMemoryDb, String> {
         .map_err(|e| format!("cannot convert the rgb-lib database: {e}"))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TransferStatus;
+    use crate::wallet::{AssetFilter, DatabaseType, Wallet, WalletData};
+    use rgbstd::containers::ConsignmentExt;
+
+    /// Snapshots written by rgb-lib-wasm 1.0.0-beta.3 (the npm package) on regtest, with what
+    /// that version listed for them. Wallet A issued the asset and sent to B, blinded then
+    /// witness. B sent some back. A last send to B is broadcast but not confirmed.
+    const FIXTURE: &str = include_str!("../../tests/fixtures/beta3_snapshots.json");
+
+    struct Fixture {
+        asset_id: String,
+        wallets: Map<String, Value>,
+    }
+
+    fn fixture() -> Fixture {
+        let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
+        Fixture {
+            asset_id: fixture["assetId"].as_str().unwrap().to_owned(),
+            wallets: fixture["wallets"].as_object().unwrap().clone(),
+        }
+    }
+
+    fn wallet_data(wallet: &Value, network: BitcoinNetwork) -> WalletData {
+        let wd = &wallet["walletData"];
+        let s = |name: &str| wd[name].as_str().unwrap().to_owned();
+        WalletData {
+            data_dir: s("dataDir"),
+            bitcoin_network: network,
+            database_type: DatabaseType::Sqlite,
+            max_allocations_per_utxo: 5,
+            account_xpub_vanilla: s("accountXpubVanilla"),
+            account_xpub_colored: s("accountXpubColored"),
+            mnemonic: Some(s("mnemonic").into()),
+            master_fingerprint: s("masterFingerprint"),
+            vanilla_keychain: None,
+            supported_schemas: vec![AssetSchema::Nia, AssetSchema::Ifa],
+            reuse_addresses: false,
+        }
+    }
+
+    fn snapshot(wallet: &Value) -> &str {
+        wallet["snapshot"].as_str().unwrap()
+    }
+
+    /// `value` with every number turned into a string, as the JS bindings return amounts.
+    fn norm(value: Value) -> Value {
+        match value {
+            Value::Number(n) => Value::String(n.to_string()),
+            Value::Array(a) => Value::Array(a.into_iter().map(norm).collect()),
+            Value::Object(o) => Value::Object(o.into_iter().map(|(k, v)| (k, norm(v))).collect()),
+            v => v,
+        }
+    }
+
+    fn migrated_wallet(wallet: &Value) -> Wallet {
+        let mut migrated = Wallet::new(wallet_data(wallet, BitcoinNetwork::Regtest)).unwrap();
+        assert_eq!(
+            wallet["legacyKey"].as_str(),
+            Some(&*migrated.legacy_idb_key())
+        );
+        assert!(migrated.migrate_legacy_snapshot(snapshot(wallet)));
+        assert_eq!(migrated.legacy_migration(), Some(LegacyMigration::Migrated));
+        migrated
+    }
+
+    /// Compare what `wallet` lists with what 1.0.0-beta.3 listed for its snapshot.
+    fn assert_same_as_beta3(wallet: &mut Wallet, expected: &Value, asset_id: &str) {
+        let balance = wallet.get_asset_balance(asset_id.to_owned()).unwrap();
+        assert_eq!(
+            norm(json!({
+                "settled": balance.settled,
+                "future": balance.future,
+                "spendable": balance.spendable,
+            })),
+            expected["balance"]
+        );
+
+        let assets = wallet.list_assets(vec![]).unwrap();
+        let nia = assets.nia.unwrap();
+        assert_eq!(nia.len(), 1);
+        let expected_nia = &expected["assets"]["nia"][0];
+        assert_eq!(nia[0].asset_id, expected_nia["assetId"].as_str().unwrap());
+        assert_eq!(nia[0].ticker, expected_nia["ticker"].as_str().unwrap());
+        assert_eq!(nia[0].name, expected_nia["name"].as_str().unwrap());
+        assert_eq!(
+            norm(json!(nia[0].issued_supply)),
+            expected_nia["issuedSupply"]
+        );
+
+        let transfers = wallet
+            .list_transfers(AssetFilter::Id(asset_id.to_owned()), None)
+            .unwrap();
+        let expected_transfers = expected["transfers"].as_array().unwrap();
+        assert_eq!(transfers.len(), expected_transfers.len());
+        for (t, e) in transfers.iter().zip(expected_transfers) {
+            let got = norm(json!({
+                "idx": t.idx,
+                "batchTransferIdx": t.batch_transfer_idx,
+                "status": t.status,
+                "kind": t.kind,
+                "txid": t.txid,
+                "recipientId": t.recipient_id,
+                "requestedAssignment": t.requested_assignment,
+                "assignments": t.assignments,
+            }));
+            let want: Map<String, Value> = got
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(|k| (k.clone(), e.get(k).cloned().unwrap_or(Value::Null)))
+                .collect();
+            assert_eq!(got, norm(Value::Object(want)), "transfer {}", t.idx);
+        }
+
+        let mut unspents: Vec<Value> = wallet
+            .list_unspents(None, false, true)
+            .unwrap()
+            .into_iter()
+            .filter(|u| u.utxo.colorable)
+            .map(|u| {
+                norm(json!({
+                    "outpoint": u.utxo.outpoint.to_string(),
+                    "allocations": u.rgb_allocations.iter().map(|a| json!({
+                        "assetId": a.asset_id,
+                        "assignment": a.assignment,
+                        "settled": a.settled,
+                    })).collect::<Vec<_>>(),
+                }))
+            })
+            .collect();
+        let mut expected_unspents: Vec<Value> = expected["unspents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|u| u["utxo"]["colorable"] == true)
+            .map(|u| {
+                let o = &u["utxo"]["outpoint"];
+                norm(json!({
+                    "outpoint": format!("{}:{}", o["txid"].as_str().unwrap(), o["vout"]),
+                    "allocations": u["rgbAllocations"],
+                }))
+            })
+            .collect();
+        let key = |v: &Value| v["outpoint"].as_str().unwrap().to_owned();
+        unspents.sort_by_key(key);
+        expected_unspents.sort_by_key(key);
+        assert_eq!(unspents, expected_unspents);
+    }
+
+    #[test]
+    fn migrates_beta3_snapshots() {
+        let fixture = fixture();
+        for (name, wallet) in &fixture.wallets {
+            let mut migrated = migrated_wallet(wallet);
+            assert_same_as_beta3(&mut migrated, &wallet["expected"], &fixture.asset_id);
+            // the stock holds every contract, bundle and witness of the legacy one
+            let stock = migrated.rgb_stock.borrow();
+            let store = stock.as_ref().unwrap().as_store();
+            assert_eq!(store.geneses().count(), 1, "wallet {name}");
+        }
+    }
+
+    #[test]
+    fn migrated_snapshot_survives_a_save() {
+        let fixture = fixture();
+        for wallet in fixture.wallets.values() {
+            let migrated = migrated_wallet(wallet);
+            let json = serde_json::to_string(&migrated.snapshot().unwrap()).unwrap();
+            assert!(!json.contains("legacy_migration_error"));
+            let mut restored = Wallet::new(wallet_data(wallet, BitcoinNetwork::Regtest)).unwrap();
+            restored
+                .restore_from_snapshot(serde_json::from_str(&json).unwrap())
+                .unwrap();
+            assert_same_as_beta3(&mut restored, &wallet["expected"], &fixture.asset_id);
+        }
+    }
+
+    #[test]
+    fn migration_is_deterministic() {
+        let fixture = fixture();
+        let wallet = &fixture.wallets["B"];
+        let encode = |m: &MigratedSnapshot| {
+            (
+                crate::wallet::idb_store::serialize_stock(&m.stock).unwrap(),
+                serde_json::to_string(&m.db).unwrap(),
+                m.received_consignments.clone(),
+            )
+        };
+        let migrate = || {
+            migrate_legacy_snapshot(
+                snapshot(wallet),
+                BitcoinNetwork::Regtest,
+                &[AssetSchema::Nia, AssetSchema::Ifa],
+                1,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(encode(&migrate()), encode(&migrate()));
+    }
+
+    #[test]
+    fn converts_received_consignments() {
+        let fixture = fixture();
+        // B accepted the last consignment and waits for its confirmation
+        let wallet = &fixture.wallets["B"];
+        let legacy: LegacySnapshot = serde_json::from_str(snapshot(wallet)).unwrap();
+        assert_eq!(legacy.received_consignments.len(), 1);
+        let migrated = migrated_wallet(wallet);
+        assert_eq!(migrated.received_consignments.len(), 1);
+        for (recipient_id, bytes) in &migrated.received_consignments {
+            let consignment = RgbTransfer::load(&bytes[..]).unwrap();
+            assert_eq!(consignment.contract_id().to_string(), fixture.asset_id);
+            // a V1 consignment is left unchanged
+            assert_eq!(&migrate_consignment(bytes).unwrap(), bytes);
+            assert!(legacy.received_consignments.contains_key(recipient_id));
+        }
+    }
+
+    #[test]
+    fn fails_unbroadcast_outgoing_transfers() {
+        let fixture = fixture();
+        let wallet = &fixture.wallets["A"];
+        let mut legacy: Value = serde_json::from_str(snapshot(wallet)).unwrap();
+        // turn the unconfirmed send of A back into one waiting for the recipient
+        let batches = legacy["db"]["batch_transfers"].as_array_mut().unwrap();
+        let pending = batches
+            .iter_mut()
+            .find(|b| b["status"] == "WaitingConfirmations")
+            .unwrap();
+        pending["status"] = json!("WaitingCounterparty");
+        let pending_idx = pending["idx"].as_i64().unwrap() as i32;
+        let migrated = migrate_legacy_snapshot(
+            &legacy.to_string(),
+            BitcoinNetwork::Regtest,
+            &[AssetSchema::Nia],
+            42,
+        )
+        .unwrap()
+        .unwrap();
+        for batch in migrated.db.iter_batch_transfers().unwrap() {
+            if batch.idx == pending_idx {
+                assert_eq!(batch.status, TransferStatus::Failed);
+                assert_eq!(batch.updated_at, 42);
+            } else {
+                assert_ne!(batch.status, TransferStatus::Failed);
+            }
+        }
+        // incoming transfers and the issuance have no main transition, sends do
+        for at in migrated.db.iter_asset_transfers().unwrap() {
+            let outgoing = migrated
+                .db
+                .iter_transfers()
+                .unwrap()
+                .iter()
+                .any(|t| t.asset_transfer_idx == at.idx && !t.incoming);
+            assert_eq!(
+                at.transition_type,
+                outgoing.then_some(crate::database::enums::TypeOfTransition::Transfer)
+            );
+        }
+    }
+
+    #[test]
+    fn skips_a_snapshot_of_another_network() {
+        let fixture = fixture();
+        let wallet = &fixture.wallets["A"];
+        let mut other = Wallet::new(wallet_data(wallet, BitcoinNetwork::Testnet)).unwrap();
+        assert!(!other.migrate_legacy_snapshot(snapshot(wallet)));
+        assert_eq!(other.legacy_migration(), None);
+        assert!(other.list_assets(vec![]).unwrap().nia.unwrap().is_empty());
+    }
+
+    #[test]
+    fn skips_a_snapshot_of_another_chain_with_the_same_bdk_network() {
+        let fixture = fixture();
+        let wallet = &fixture.wallets["A"];
+        let mut legacy: Value = serde_json::from_str(snapshot(wallet)).unwrap();
+        // signet and custom signets share the BDK network: only the contracts tell them apart
+        legacy["bdk_changeset"]["network"] = json!("signet");
+        let json = legacy.to_string();
+        let schemas = [AssetSchema::Nia];
+        assert!(
+            migrate_legacy_snapshot(&json, BitcoinNetwork::SignetCustom, &schemas, 1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            migrate_legacy_snapshot(&json, BitcoinNetwork::Signet, &schemas, 1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            migrate_legacy_snapshot(&json, BitcoinNetwork::Testnet, &schemas, 1)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_snapshot_that_cannot_be_decoded_leaves_the_wallet_usable() {
+        let fixture = fixture();
+        let wallet = &fixture.wallets["A"];
+        let mut legacy: Value = serde_json::from_str(snapshot(wallet)).unwrap();
+        legacy["stock_stash_b64"] = json!("AAAA");
+        let mut broken = Wallet::new(wallet_data(wallet, BitcoinNetwork::Regtest)).unwrap();
+        assert!(!broken.migrate_legacy_snapshot(&legacy.to_string()));
+        let Some(LegacyMigration::Failed { error }) = broken.legacy_migration() else {
+            panic!("the migration did not fail");
+        };
+        assert!(error.contains("stash"), "{error}");
+        assert!(broken.list_assets(vec![]).unwrap().nia.unwrap().is_empty());
+        // the failure is saved with the wallet, so the next open reports it and tries again
+        let saved = broken.snapshot().unwrap();
+        assert_eq!(saved.legacy_migration_error, Some(error));
+
+        // a later migration that succeeds replaces the state and clears the failure
+        assert!(broken.migrate_legacy_snapshot(snapshot(wallet)));
+        assert_eq!(broken.legacy_migration(), Some(LegacyMigration::Migrated));
+        assert_eq!(broken.snapshot().unwrap().legacy_migration_error, None);
+        assert_same_as_beta3(&mut broken, &wallet["expected"], &fixture.asset_id);
+    }
+
+    #[test]
+    fn refuses_contracts_of_an_unsupported_schema() {
+        let fixture = fixture();
+        let wallet = &fixture.wallets["A"];
+        let err = migrate_legacy_snapshot(
+            snapshot(wallet),
+            BitcoinNetwork::Regtest,
+            &[AssetSchema::Ifa],
+            1,
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("does not support"), "{err}");
+    }
+}
