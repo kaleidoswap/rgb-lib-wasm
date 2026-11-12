@@ -4,6 +4,7 @@
 
 pub(crate) mod backup;
 pub mod idb_store;
+pub(crate) mod legacy_snapshot;
 pub(crate) mod memory_store;
 pub(crate) mod offline;
 #[cfg(feature = "esplora")]
@@ -23,6 +24,7 @@ mod test_send;
 mod test_vanilla;
 pub mod vss;
 
+pub use legacy_snapshot::LegacyMigration;
 pub use offline::*;
 #[cfg(feature = "esplora")]
 pub use online::*;
