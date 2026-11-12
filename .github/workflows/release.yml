@@ -23,9 +23,9 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
       - name: Check branch
-        if: github.ref != 'refs/heads/master'
+        if: ${{ !startsWith(github.ref, 'refs/heads/ks/release/') }}
         run: |
-          echo "::error::Release runs from master only, not ${GITHUB_REF}"
+          echo "::error::Release runs from a ks/release/ branch only, not ${GITHUB_REF}"
           exit 1
 
       - name: Normalize version
@@ -88,9 +88,9 @@ jobs:
         run: |
           node -e "
             const pkg = require('./package.json');
-            pkg.name = '@utexo/rgb-lib-wasm';
+            pkg.name = '@kaleidorg/rgb-lib-wasm';
             pkg.version = process.env.VERSION;
-            pkg.repository = { type: 'git', url: 'git+https://github.com/UTEXO-Protocol/rgb-lib-wasm.git' };
+            pkg.repository = { type: 'git', url: 'git+https://github.com/kaleidoswap/rgb-lib-wasm.git' };
             // wasm-pack does not list the inline JS snippets, which the bindings import.
             if (require('fs').existsSync('snippets') && !pkg.files.includes('snippets')) pkg.files.push('snippets');
             require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
@@ -138,10 +138,10 @@ jobs:
             ### Installation
 
             ```bash
-            npm install @utexo/rgb-lib-wasm@${{ needs.verify.outputs.version }}
+            npm install @kaleidorg/rgb-lib-wasm@${{ needs.verify.outputs.version }}
             ```
           draft: false
-          prerelease: ${{ contains(needs.verify.outputs.version, 'alpha') || contains(needs.verify.outputs.version, 'beta') || contains(needs.verify.outputs.version, 'rc') }}
+          prerelease: ${{ contains(needs.verify.outputs.version, '-') }}
           files: rgb-lib-wasm-pkg.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
