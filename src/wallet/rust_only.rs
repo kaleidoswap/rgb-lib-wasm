@@ -2790,6 +2790,53 @@ mod psbt_op_tests {
     }
 
     #[test]
+    fn a_claim_to_an_own_colored_address_is_change_and_needs_no_consignment() {
+        let (mut wallet, contract_id, outpoint) = wallet_with_foreign_allocation();
+        let script = wallet
+            ._get_new_address(KeychainKind::External)
+            .unwrap()
+            .script_pubkey();
+        let mut psbt = claim_psbt(outpoint, script, 500);
+        let prepared = wallet
+            .psbt_op_prepare_in_memory(
+                &mut psbt,
+                coloring(contract_id, 1, AMOUNT),
+                vec![outpoint],
+                1,
+                PsbtOpExpiry::Never,
+            )
+            .unwrap();
+        let op = prepared.operation_id;
+        let db_data = wallet.database.get_db_data(false).unwrap();
+        assert!(
+            db_data
+                .colorings
+                .iter()
+                .any(|c| c.r#type == ColoringType::Change
+                    && c.assignment == Assignment::Fungible(AMOUNT)),
+            "the payout is recorded as change"
+        );
+
+        wallet
+            .psbt_op_apply_in_memory(&op, WitnessOrd::Tentative)
+            .unwrap();
+        let txid = psbt.unsigned_tx.compute_txid();
+        let held: u64 = wallet
+            .rgb_runtime()
+            .unwrap()
+            .contract_assignments_for(contract_id, [OutPoint::new(txid, 1)])
+            .unwrap()
+            .into_values()
+            .flat_map(|states| states.into_values())
+            .map(|state| match state {
+                AllocatedState::Amount(amount) => amount.as_u64(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(held, AMOUNT, "spendable with no consignment hand-over");
+    }
+
+    #[test]
     fn abort_rolls_back_only_what_never_reached_the_network() {
         let (mut wallet, contract_id, outpoint) = wallet_with_foreign_allocation();
         let (_, script) = witness_receive(&mut wallet);
