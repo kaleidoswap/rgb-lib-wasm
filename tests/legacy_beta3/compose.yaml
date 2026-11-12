@@ -1,0 +1,17 @@
+services:
+  bitcoind:
+    image: polarlightning/bitcoind:27.0
+    command: ["bitcoind","-regtest=1","-server=1","-rpcbind=0.0.0.0","-rpcallowip=0.0.0.0/0","-rpcuser=user","-rpcpassword=pass","-txindex=1","-fallbackfee=0.0002","-rpcworkqueue=512"]
+    ports: ["127.0.0.1:24443:18443"]
+  electrs:
+    image: ghcr.io/vulpemventures/electrs@sha256:999a2218f423c0fb167ee53b282aa7929a9d4abba38ef16f67f407acd00589d4
+    entrypoint: ["/build/electrs"]
+    command: ["--network=regtest","--daemon-rpc-addr=bitcoind:18443","--cookie=user:pass","--http-addr=0.0.0.0:3002","--electrum-rpc-addr=0.0.0.0:50001","--jsonrpc-import"]
+    ports: ["127.0.0.1:24502:3002"]
+    depends_on: [bitcoind]
+  proxy03:
+    image: ghcr.io/rgb-tools/rgb-proxy-server:0.3.0
+    ports: ["127.0.0.1:24500:3000"]
+  proxy04:
+    image: ghcr.io/rgb-tools/rgb-proxy-server:0.4.0
+    ports: ["127.0.0.1:24510:3000"]
