@@ -1265,8 +1265,8 @@ impl WasmWallet {
 
 #[wasm_bindgen]
 impl WasmWallet {
-    /// Accept a swap offer as the taker. Not supported yet with RGB proxy protocol 1.0: always
-    /// rejects with "Not supported yet with RGB proxy protocol 1.0: accept_swap_offer".
+    /// Accept a swap offer as the taker and return the request to forward to the maker. Inputs in
+    /// `exclude_outpoints` (optional) are never selected.
     #[wasm_bindgen(js_name = "acceptSwapOffer")]
     pub async fn accept_swap_offer(
         &self,
@@ -1312,8 +1312,9 @@ impl WasmWallet {
         to_js(&amount)
     }
 
-    /// Complete a maker proposal as the taker. Not supported yet with RGB proxy protocol 1.0:
-    /// always rejects.
+    /// Complete a maker proposal as the taker and return the completion to forward to the maker.
+    /// When the taker sends RGB, the completion carries its consignment (base64): no proxy is
+    /// involved.
     #[wasm_bindgen(js_name = "completeSwapProposal")]
     pub async fn complete_swap_proposal(
         &self,
@@ -1333,8 +1334,9 @@ impl WasmWallet {
         to_js(&completion)
     }
 
-    /// Accept the RGB transfer received from a broadcast swap. `role` is "Taker". Not supported
-    /// yet with RGB proxy protocol 1.0: always rejects.
+    /// Settle a swap once the maker has broadcast it, with the maker's completion or the one this
+    /// wallet signed. `role` must be "Taker". Returns the assignments received, empty when the
+    /// taker receives BTC.
     #[wasm_bindgen(js_name = "acceptSwapTransfers")]
     pub async fn accept_swap_transfers(
         &self,
