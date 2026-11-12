@@ -521,9 +521,7 @@ mod tests {
             maker_rgb_recipient_id: None,
             maker_rgb_script_pubkey_hex: None,
             maker_rgb_blinding: None,
-            proxy_url: None,
-            platform_fee_sat: 0,
-            fee_recipient_script_pubkey_hex: None,
+            extra_outputs: vec![],
         }
     }
 
@@ -581,6 +579,7 @@ mod tests {
             txid: String::new(),
             consignments: vec![],
             maker_history: None,
+            lock_time: 0,
         };
         not_supported(
             block_on(wallet.complete_swap_proposal(online.clone(), proposal.clone(), 1, true))
