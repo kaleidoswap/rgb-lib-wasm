@@ -235,8 +235,8 @@ impl AssignmentsCollection {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct AssetSpend {
-    txo_map: HashMap<i32, Outpoint>,
+pub(crate) struct AssetSpend {
+    pub(crate) txo_map: HashMap<i32, Outpoint>,
     assignments_collected: AssignmentsCollection,
     input_btc_amt: u64,
 }
@@ -1727,7 +1727,7 @@ impl Wallet {
         received
     }
 
-    fn _select_rgb_inputs(
+    pub(crate) fn _select_rgb_inputs(
         &self,
         asset_id: String,
         assignments_needed: &AssignmentsCollection,
@@ -2463,7 +2463,7 @@ impl Wallet {
         Ok(input_unspents)
     }
 
-    fn _get_transfer_begin_data(
+    pub(crate) fn _get_transfer_begin_data(
         &mut self,
         online: Online,
         fee_rate: u64,

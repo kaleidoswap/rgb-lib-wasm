@@ -218,7 +218,7 @@ pub struct AcceptedTransfer {
 }
 
 #[cfg(feature = "esplora")]
-type SpentByContract = HashMap<ContractId, HashMap<OutPoint, Vec<Assignment>>>;
+pub(crate) type SpentByContract = HashMap<ContractId, HashMap<OutPoint, Vec<Assignment>>>;
 
 /// What `fascia`'s transitions assign. Every owned-state type the wallet's schemas define is
 /// reported; any other is an error rather than left out.
@@ -1342,7 +1342,7 @@ impl Wallet {
     /// Record a PSBT operation as an `Initiated` outgoing batch transfer: the allocations it spends
     /// from this wallet's coins, the change it gets back and the recipients it pays.
     #[allow(clippy::too_many_arguments)]
-    fn psbt_op_record_batch(
+    pub(crate) fn psbt_op_record_batch(
         &self,
         runtime: &RgbRuntime,
         psbt: &Psbt,
@@ -2143,7 +2143,7 @@ impl Wallet {
 
     /// Validate a transfer whose witness `witness_id` may not be broadcast yet: that witness is
     /// taken from the consignment, every other one from `history`.
-    fn validate_transfer_offchain(
+    pub(crate) fn validate_transfer_offchain(
         &self,
         consignment: &RgbTransfer,
         witness_id: RgbTxid,
