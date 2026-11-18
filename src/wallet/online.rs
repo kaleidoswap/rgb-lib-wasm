@@ -2718,6 +2718,7 @@ impl Wallet {
             }
             // unspent DB TXOs must be in BDK's unspent list after a full scan
             self.sync_and_save(true).await?;
+            self._record_legacy_vanilla_spends().await?;
             let bdk_utxos: HashSet<String> = self
                 .bdk_wallet
                 .list_unspent()
@@ -2948,6 +2949,110 @@ impl Wallet {
         self.bdk_wallet.persist(&mut self.bdk_database)?;
 
         Ok(tx)
+    }
+
+    /// Record the vanilla spends of a wallet migrated from 1.0.0-beta.3.
+    ///
+    /// 1.0.0-beta.3 wrote no row for its BTC sends, so the consistency check would take a wallet
+    /// output one of them spends for an output spent by another wallet. A migrated wallet is
+    /// known by the rows 1.0.0-beta.3 wrote, which have no inputs. This fills those rows from
+    /// BDK's graph and records as settled [`WalletTransactionType::SendBtc`] the other wallet
+    /// TXs that spend wallet outputs but no TXO. A TX that spends a TXO is left to the check.
+    async fn _record_legacy_vanilla_spends(&mut self) -> Result<(), Error> {
+        let rows = self.database.iter_wallet_transactions()?;
+        let legacy: HashMap<String, i32> = rows
+            .iter()
+            .filter(|r| r.inputs.is_empty())
+            .map(|r| (r.txid.clone(), r.idx))
+            .collect();
+        if legacy.is_empty() {
+            return Ok(());
+        }
+        let known: HashSet<String> = rows
+            .into_iter()
+            .map(|r| r.txid)
+            .chain(
+                self.database
+                    .iter_batch_transfers()?
+                    .into_iter()
+                    .filter_map(|bt| bt.txid),
+            )
+            .collect();
+        let txos: HashSet<String> = self
+            .database
+            .iter_txos()?
+            .into_iter()
+            .map(|t| t.outpoint().to_string())
+            .collect();
+        let mut updates = vec![];
+        for wallet_tx in self.bdk_wallet.transactions() {
+            let tx = &wallet_tx.tx_node.tx;
+            let txid = wallet_tx.tx_node.txid.to_string();
+            let legacy_idx = legacy.get(&txid).copied();
+            if legacy_idx.is_none() && known.contains(&txid) {
+                continue;
+            }
+            let (sent, received) = self.bdk_wallet.sent_and_received(tx);
+            if legacy_idx.is_none()
+                && (sent.to_sat() == 0
+                    || tx
+                        .input
+                        .iter()
+                        .any(|i| txos.contains(&i.previous_output.to_string())))
+            {
+                continue;
+            }
+            let fee = self
+                .bdk_wallet
+                .calculate_fee(tx)
+                .map_err(|e| Error::Internal {
+                    details: e.to_string(),
+                })?;
+            let status = if wallet_tx.chain_position.is_confirmed() {
+                TransferStatus::Settled
+            } else {
+                TransferStatus::WaitingConfirmations
+            };
+            updates.push((
+                legacy_idx,
+                DbWalletTransactionActMod {
+                    txid: ActiveValue::Set(txid),
+                    r#type: ActiveValue::Set(WalletTransactionType::SendBtc),
+                    status: ActiveValue::Set(status),
+                    inputs: ActiveValue::Set(
+                        tx.input
+                            .iter()
+                            .map(|i| Outpoint::from(i.previous_output))
+                            .collect(),
+                    ),
+                    sent: ActiveValue::Set(sent.to_sat()),
+                    received: ActiveValue::Set(received.to_sat()),
+                    fee: ActiveValue::Set(fee.to_sat()),
+                    ..Default::default()
+                },
+            ));
+        }
+        if updates.is_empty() {
+            return Ok(());
+        }
+        info!(
+            self.logger,
+            "Recording {} vanilla TXs of the 1.0.0-beta.3 history",
+            updates.len()
+        );
+        for (legacy_idx, mut row) in updates {
+            if let Some(idx) = legacy_idx {
+                // a legacy row keeps its type and status
+                row.idx = ActiveValue::Set(idx);
+                row.r#type = ActiveValue::NotSet;
+                row.status = ActiveValue::NotSet;
+                self.database.update_wallet_transaction(row)?;
+            } else {
+                self.database.set_wallet_transaction(row)?;
+            }
+        }
+        self.update_backup_info(false)?;
+        self.flush().await
     }
 
     async fn _record_vanilla_begin(
@@ -11708,6 +11813,145 @@ mod send_end_tests {
         assert!(pending_witness(&wallet, paid_txo));
         assert!(!pending_witness(&wallet, txos[1]));
         assert!(!pending_witness(&wallet, txos[2]));
+    }
+
+    fn tx_spending(
+        inputs: &[OutPoint],
+        outputs: Vec<(ScriptBuf, u64)>,
+    ) -> bdk_wallet::bitcoin::Transaction {
+        use bdk_wallet::bitcoin::{Amount, TxIn, TxOut};
+        bdk_wallet::bitcoin::Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: inputs
+                .iter()
+                .map(|o| TxIn {
+                    previous_output: *o,
+                    ..Default::default()
+                })
+                .collect(),
+            output: outputs
+                .into_iter()
+                .map(|(script_pubkey, sat)| TxOut {
+                    value: Amount::from_sat(sat),
+                    script_pubkey,
+                })
+                .collect(),
+        }
+    }
+
+    // A 1.0.0-beta.3 history: a create UTXOs recorded without inputs, a BTC send of its change
+    // not recorded, and a TX of another wallet spending its colored output.
+    #[test]
+    fn records_the_vanilla_spends_of_a_migrated_wallet() {
+        use bdk_wallet::KeychainKind;
+        let (mut wallet, _online) = setup();
+        let colored = wallet
+            .bdk_wallet
+            .reveal_next_address(KeychainKind::External)
+            .script_pubkey();
+        let vanilla = wallet
+            .bdk_wallet
+            .reveal_next_address(KeychainKind::Internal)
+            .script_pubkey();
+        let funding = tx_spending(
+            &[OutPoint::new(Txid::from_byte_array([7; 32]), 0)],
+            vec![(vanilla.clone(), 100_000)],
+        );
+        let funding_txid = funding.compute_txid();
+        let create = tx_spending(
+            &[OutPoint::new(funding_txid, 0)],
+            vec![(colored, 1_000), (vanilla.clone(), 98_800)],
+        );
+        let create_txid = create.compute_txid();
+        let send = tx_spending(
+            &[OutPoint::new(create_txid, 1)],
+            vec![(ScriptBuf::new(), 50_000), (vanilla, 48_600)],
+        );
+        let send_txid = send.compute_txid();
+        let other = tx_spending(
+            &[OutPoint::new(create_txid, 0)],
+            vec![(ScriptBuf::new(), 800)],
+        );
+        let other_txid = other.compute_txid();
+        wallet
+            .bdk_wallet
+            .apply_unconfirmed_txs([(funding, 1), (create, 2), (send, 3), (other, 4)]);
+        seed_txo(&wallet, &create_txid.to_string(), 0);
+        seed_vanilla(
+            &wallet,
+            &create_txid.to_string(),
+            WalletTransactionType::CreateUtxos,
+            TransferStatus::Settled,
+            vec![],
+        );
+
+        block_on(wallet._record_legacy_vanilla_spends()).unwrap();
+        let rows = wallet.database.iter_wallet_transactions().unwrap();
+        let row = |txid: Txid| rows.iter().find(|r| r.txid == txid.to_string()).cloned();
+        let create_row = row(create_txid).unwrap();
+        assert_eq!(create_row.r#type, WalletTransactionType::CreateUtxos);
+        assert_eq!(create_row.status, TransferStatus::Settled);
+        assert_eq!(
+            create_row.inputs,
+            vec![Outpoint::from(OutPoint::new(funding_txid, 0))]
+        );
+        assert_eq!((create_row.sent, create_row.fee), (100_000, 200));
+        let send_row = row(send_txid).unwrap();
+        assert_eq!(send_row.r#type, WalletTransactionType::SendBtc);
+        assert_eq!(send_row.status, TransferStatus::WaitingConfirmations);
+        assert_eq!(
+            send_row.inputs,
+            vec![Outpoint::from(OutPoint::new(create_txid, 1))]
+        );
+        assert_eq!(
+            (send_row.sent, send_row.received, send_row.fee),
+            (98_800, 48_600, 200)
+        );
+        assert!(row(funding_txid).is_none());
+        assert!(row(other_txid).is_none());
+        assert_eq!(rows.len(), 2);
+
+        // the history is recorded once: a later TX of another wallet is left to the check
+        let later = tx_spending(
+            &[OutPoint::new(send_txid, 1)],
+            vec![(ScriptBuf::new(), 48_000)],
+        );
+        let later_txid = later.compute_txid();
+        wallet.bdk_wallet.apply_unconfirmed_txs([(later, 5)]);
+        block_on(wallet._record_legacy_vanilla_spends()).unwrap();
+        let rows = wallet.database.iter_wallet_transactions().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.txid != later_txid.to_string()));
+    }
+
+    #[test]
+    fn records_nothing_for_a_wallet_without_legacy_rows() {
+        use bdk_wallet::KeychainKind;
+        let (mut wallet, _online) = setup();
+        let vanilla = wallet
+            .bdk_wallet
+            .reveal_next_address(KeychainKind::Internal)
+            .script_pubkey();
+        let funding = tx_spending(
+            &[OutPoint::new(Txid::from_byte_array([8; 32]), 0)],
+            vec![(vanilla, 10_000)],
+        );
+        let send = tx_spending(
+            &[OutPoint::new(funding.compute_txid(), 0)],
+            vec![(ScriptBuf::new(), 9_000)],
+        );
+        wallet
+            .bdk_wallet
+            .apply_unconfirmed_txs([(funding, 1), (send, 2)]);
+        block_on(wallet._record_legacy_vanilla_spends()).unwrap();
+        assert!(
+            wallet
+                .database
+                .iter_wallet_transactions()
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 

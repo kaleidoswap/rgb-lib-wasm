@@ -1261,6 +1261,18 @@ impl InMemoryDb {
         if let ActiveValue::Set(v) = w.status {
             row.status = v;
         }
+        if let ActiveValue::Set(v) = w.inputs {
+            row.inputs = v;
+        }
+        if let ActiveValue::Set(v) = w.sent {
+            row.sent = v;
+        }
+        if let ActiveValue::Set(v) = w.received {
+            row.received = v;
+        }
+        if let ActiveValue::Set(v) = w.fee {
+            row.fee = v;
+        }
         Ok(())
     }
 
