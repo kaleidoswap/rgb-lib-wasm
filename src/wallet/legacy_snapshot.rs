@@ -552,6 +552,7 @@ mod tests {
             vanilla_keychain: None,
             supported_schemas: vec![AssetSchema::Nia, AssetSchema::Ifa],
             reuse_addresses: false,
+            allow_reckless_schemas: false,
         }
     }
 
