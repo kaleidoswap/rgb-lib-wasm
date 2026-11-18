@@ -2993,21 +2993,26 @@ impl Wallet {
                 continue;
             }
             let (sent, received) = self.bdk_wallet.sent_and_received(tx);
-            if legacy_idx.is_none()
-                && (sent.to_sat() == 0
-                    || tx
-                        .input
-                        .iter()
-                        .any(|i| txos.contains(&i.previous_output.to_string())))
-            {
+            // a recorded send spends only vanilla outputs of this wallet
+            let own_vanilla_inputs = tx.input.iter().all(|i| {
+                !txos.contains(&i.previous_output.to_string())
+                    && self
+                        .bdk_wallet
+                        .tx_graph()
+                        .get_txout(i.previous_output)
+                        .is_some_and(|o| self.bdk_wallet.is_mine(o.script_pubkey.clone()))
+            });
+            if legacy_idx.is_none() && (sent.to_sat() == 0 || !own_vanilla_inputs) {
                 continue;
             }
-            let fee = self
-                .bdk_wallet
-                .calculate_fee(tx)
-                .map_err(|e| Error::Internal {
-                    details: e.to_string(),
-                })?;
+            // a fee BDK cannot compute must not keep the wallet offline
+            let fee = match self.bdk_wallet.calculate_fee(tx) {
+                Ok(fee) => fee,
+                Err(e) => {
+                    warn!(self.logger, "Cannot compute the fee of TX {txid}: {e}");
+                    bdk_wallet::bitcoin::Amount::ZERO
+                }
+            };
             let status = if wallet_tx.chain_position.is_confirmed() {
                 TransferStatus::Settled
             } else {
@@ -11923,6 +11928,44 @@ mod send_end_tests {
         let rows = wallet.database.iter_wallet_transactions().unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.txid != later_txid.to_string()));
+    }
+
+    // A TX with an input of another wallet is not a send of this wallet, and a legacy row whose
+    // fee cannot be computed is filled without one.
+    #[test]
+    fn skips_foreign_inputs_and_unknown_fees() {
+        use bdk_wallet::KeychainKind;
+        let (mut wallet, _online) = setup();
+        let vanilla = wallet
+            .bdk_wallet
+            .reveal_next_address(KeychainKind::Internal)
+            .script_pubkey();
+        let foreign = OutPoint::new(Txid::from_byte_array([9; 32]), 0);
+        let legacy = tx_spending(&[foreign], vec![(vanilla, 10_000)]);
+        let legacy_txid = legacy.compute_txid();
+        let mixed = tx_spending(
+            &[OutPoint::new(legacy_txid, 0), foreign],
+            vec![(ScriptBuf::new(), 15_000)],
+        );
+        let mixed_txid = mixed.compute_txid();
+        wallet
+            .bdk_wallet
+            .apply_unconfirmed_txs([(legacy, 1), (mixed, 2)]);
+        seed_vanilla(
+            &wallet,
+            &legacy_txid.to_string(),
+            WalletTransactionType::CreateUtxos,
+            TransferStatus::Settled,
+            vec![],
+        );
+
+        block_on(wallet._record_legacy_vanilla_spends()).unwrap();
+        let rows = wallet.database.iter_wallet_transactions().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].txid, legacy_txid.to_string());
+        assert_eq!(rows[0].inputs, vec![Outpoint::from(foreign)]);
+        assert_eq!(rows[0].fee, 0);
+        assert!(rows.iter().all(|r| r.txid != mixed_txid.to_string()));
     }
 
     #[test]
