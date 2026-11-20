@@ -1076,3 +1076,29 @@ async fn test_failed_save_of_an_async_call_is_an_error() {
         "witness_receive returned {res:?} with a failed save"
     );
 }
+
+#[wasm_bindgen_test]
+async fn test_saved_wallet_leaves_no_open_connection() {
+    let keys = generate_keys(BitcoinNetwork::Regtest);
+    let wd = test_wallet_data(
+        &keys,
+        vec![AssetSchema::Nia],
+        &format!("/tmp/close-{}", js_sys::Date::now()),
+    );
+    let wallet = Wallet::new(wd.clone()).unwrap();
+    // A save and a load, with the restored wallet still alive.
+    let restored = simulate_reload(wallet, &wd).await;
+
+    let delete = js_sys::Function::new_no_args(
+        r#"return new Promise((resolve) => {
+            const req = indexedDB.deleteDatabase("rgb_lib_wallet");
+            req.onsuccess = () => resolve("deleted");
+            req.onerror = () => resolve("error");
+            req.onblocked = () => resolve("blocked");
+        });"#,
+    );
+    let promise: js_sys::Promise = delete.call0(&wasm_bindgen::JsValue::NULL).unwrap().into();
+    let outcome = wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+    assert_eq!(outcome.as_string().as_deref(), Some("deleted"));
+    drop(restored);
+}
