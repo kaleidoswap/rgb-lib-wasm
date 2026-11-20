@@ -83,6 +83,18 @@ pub async fn save_snapshot(
     loaded: Option<(u64, u64)>,
 ) -> Result<(), String> {
     let db = web_sys::IdbDatabase::from(open_db().await?);
+    let result = save_snapshot_with(&db, key, snapshot, loaded).await;
+    // An open connection blocks deleting the database until it is garbage collected.
+    db.close();
+    result
+}
+
+async fn save_snapshot_with(
+    db: &web_sys::IdbDatabase,
+    key: &str,
+    snapshot: &WalletSnapshot,
+    loaded: Option<(u64, u64)>,
+) -> Result<(), String> {
     let options = js_sys::Object::new();
     js_sys::Reflect::set(&options, &"durability".into(), &"strict".into())
         .map_err(|e| format!("IndexedDB transaction error: {e:?}"))?;
@@ -227,6 +239,12 @@ pub async fn load_snapshot(key: &str) -> Result<Option<WalletSnapshot>, String> 
 /// Load the JSON stored in IndexedDB under the given key.
 pub(crate) async fn load_raw(key: &str) -> Result<Option<String>, String> {
     let db = open_db().await?;
+    let result = load_raw_with(&db, key).await;
+    db.close();
+    result
+}
+
+async fn load_raw_with(db: &idb::Database, key: &str) -> Result<Option<String>, String> {
     let tx = db
         .transaction(&[STORE_NAME], idb::TransactionMode::ReadOnly)
         .map_err(|e| format!("IndexedDB transaction error: {e:?}"))?;
