@@ -677,6 +677,78 @@ mod tests {
         }
     }
 
+    // The beta.3 file/VSS exporter wrote six fields of its live IndexedDB snapshot.
+    // Use those exact fields from the fixture produced by the released beta engine.
+    fn beta3_backup_payload(wallet: &Value) -> Value {
+        let mut source: Value = serde_json::from_str(snapshot(wallet)).unwrap();
+        let mut backup = Map::new();
+        for key in [
+            "db",
+            "bdk_changeset",
+            "stock_stash_b64",
+            "stock_state_b64",
+            "stock_index_b64",
+            "reuse_address_index",
+        ] {
+            backup.insert(key.to_owned(), source.get_mut(key).unwrap().take());
+        }
+        Value::Object(backup)
+    }
+
+    fn encrypted_backup(payload: &Value) -> Vec<u8> {
+        use crate::wallet::backup::{encode_backup, encrypt_payload};
+        let (bytes, envelope) =
+            encrypt_payload(&serde_json::to_vec(payload).unwrap(), "test").unwrap();
+        encode_backup(&bytes, &envelope).unwrap()
+    }
+
+    fn wallet_state(wallet: &Wallet) -> Value {
+        let mut snapshot = wallet.snapshot().unwrap();
+        // Taking a snapshot reserves a write sequence even when no wallet state changed.
+        snapshot.sequence = 0;
+        serde_json::to_value(snapshot).unwrap()
+    }
+
+    #[test]
+    fn restores_encrypted_beta3_backup() {
+        let fixture = fixture();
+        let source = &fixture.wallets["A"];
+        let backup = encrypted_backup(&beta3_backup_payload(source));
+        let mut restored = Wallet::new(wallet_data(source, BitcoinNetwork::Regtest)).unwrap();
+        restored.restore_backup(&backup, "test").unwrap();
+        assert_same_as_beta3(&mut restored, &source["expected"], &fixture.asset_id);
+
+        for (source, network) in [
+            (&fixture.wallets["B"], BitcoinNetwork::Regtest),
+            (source, BitcoinNetwork::Testnet),
+        ] {
+            let mut wrong = Wallet::new(wallet_data(source, network)).unwrap();
+            let before = wallet_state(&wrong);
+            assert!(wrong.restore_backup(&backup, "test").is_err());
+            assert_eq!(wallet_state(&wrong), before);
+        }
+    }
+
+    #[test]
+    fn rejects_damaged_or_mixed_beta3_backups_atomically() {
+        let fixture = fixture();
+        let source = &fixture.wallets["A"];
+        let mut restored = migrated_wallet(source);
+        let before = wallet_state(&restored);
+        for (key, invalid) in [
+            ("rgb_store", json!("invalid current-format store")),
+            ("stock_stash_b64", json!("invalid beta.3 stash")),
+            ("bdk_changeset", Value::Null),
+        ] {
+            let mut payload = beta3_backup_payload(source);
+            payload[key] = invalid;
+            let backup = encrypted_backup(&payload);
+            assert!(restored.restore_backup(&backup, "test").is_err());
+            assert_eq!(wallet_state(&restored), before);
+            assert_eq!(restored.legacy_migration(), Some(LegacyMigration::Migrated));
+        }
+    }
+
     #[test]
     fn migrated_snapshot_survives_a_save() {
         let fixture = fixture();

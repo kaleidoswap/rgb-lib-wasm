@@ -1382,35 +1382,7 @@ impl Wallet {
     /// nothing. A snapshot that cannot be migrated changes nothing but the outcome.
     pub(crate) fn migrate_legacy_snapshot(&mut self, json: &str) -> bool {
         info!(self.logger, "Migrating the 1.0.0-beta.3 snapshot...");
-        let migrated = super::legacy_snapshot::migrate_legacy_snapshot(
-            json,
-            self.wallet_data.bitcoin_network,
-            &self.wallet_data.supported_schemas,
-            now().unix_timestamp(),
-        )
-        .and_then(|migrated| {
-            let Some(migrated) = migrated else {
-                return Ok(None);
-            };
-            let rgb_store = super::idb_store::serialize_stock(&migrated.stock)
-                .ok_or_else(|| s!("cannot serialize the RGB stock"))?;
-            Ok(Some(super::idb_store::WalletSnapshot {
-                writer: self.idb_writer,
-                sequence: 0,
-                db: migrated.db,
-                // the BDK wallet of this object is kept: the next full scan rebuilds it
-                bdk_changeset: None,
-                transfer_artifacts: HashMap::new(),
-                received_consignments: migrated.received_consignments,
-                received_consignment_meta: HashMap::new(),
-                received_signed_txs: HashMap::new(),
-                received_mints: HashMap::new(),
-                rgb_store,
-                reuse_address_index: migrated.reuse_address_index,
-                legacy_migration_error: None,
-            }))
-        })
-        .and_then(|snapshot| {
+        let migrated = self.convert_legacy_snapshot(json).and_then(|snapshot| {
             snapshot
                 .map(|snapshot| {
                     self.restore_from_snapshot(snapshot)
@@ -1440,6 +1412,42 @@ impl Wallet {
                 false
             }
         }
+    }
+
+    /// Convert beta.3 state without changing the wallet. The caller decides how to
+    /// handle a missing or incompatible snapshot before committing the restore.
+    pub(crate) fn convert_legacy_snapshot(
+        &self,
+        json: &str,
+    ) -> Result<Option<super::idb_store::WalletSnapshot>, String> {
+        super::legacy_snapshot::migrate_legacy_snapshot(
+            json,
+            self.wallet_data.bitcoin_network,
+            &self.wallet_data.supported_schemas,
+            now().unix_timestamp(),
+        )
+        .and_then(|migrated| {
+            let Some(migrated) = migrated else {
+                return Ok(None);
+            };
+            let rgb_store = super::idb_store::serialize_stock(&migrated.stock)
+                .ok_or_else(|| s!("cannot serialize the RGB stock"))?;
+            Ok(Some(super::idb_store::WalletSnapshot {
+                writer: self.idb_writer,
+                sequence: 0,
+                db: migrated.db,
+                // the BDK wallet of this object is kept: the next full scan rebuilds it
+                bdk_changeset: None,
+                transfer_artifacts: HashMap::new(),
+                received_consignments: migrated.received_consignments,
+                received_consignment_meta: HashMap::new(),
+                received_signed_txs: HashMap::new(),
+                received_mints: HashMap::new(),
+                rgb_store,
+                reuse_address_index: migrated.reuse_address_index,
+                legacy_migration_error: None,
+            }))
+        })
     }
 
     /// Create a new RGB wallet based on the provided [`WalletData`].

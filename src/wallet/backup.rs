@@ -174,14 +174,26 @@ impl super::Wallet {
 
     /// Restore the wallet and the RGB stock from a backup payload. Both restore paths use it.
     fn restore_payload(&mut self, payload_json: &[u8]) -> Result<(), Error> {
-        let payload: WalletBackupPayload =
-            serde_json::from_slice(payload_json).map_err(|_| Error::InvalidBackup)?;
+        let snapshot = match serde_json::from_slice::<WalletBackupPayload>(payload_json) {
+            Ok(payload) => self.snapshot_from_backup(payload)?,
+            Err(_) => self.snapshot_from_beta3_backup(payload_json)?,
+        };
+        self.restore_from_snapshot(snapshot)?;
+        // the backup replaces the state a failed 1.0.0-beta.3 migration left: do not retry it
+        self.legacy_migration = None;
+        Ok(())
+    }
+
+    fn snapshot_from_backup(
+        &self,
+        payload: WalletBackupPayload,
+    ) -> Result<super::idb_store::WalletSnapshot, Error> {
         // Without a BDK changeset the restore skips the descriptor check.
         if payload.bdk_changeset.is_none() && self.bdk_database.get_data().is_some() {
             return Err(Error::InvalidBackup);
         }
 
-        let snapshot = super::idb_store::WalletSnapshot {
+        Ok(super::idb_store::WalletSnapshot {
             writer: 0,
             sequence: 0,
             db: payload.db,
@@ -194,11 +206,54 @@ impl super::Wallet {
             rgb_store: payload.rgb_store,
             reuse_address_index: payload.reuse_address_index,
             legacy_migration_error: None,
-        };
-        self.restore_from_snapshot(snapshot)?;
-        // the backup replaces the state a failed 1.0.0-beta.3 migration left: do not retry it
-        self.legacy_migration = None;
-        Ok(())
+        })
+    }
+
+    fn snapshot_from_beta3_backup(
+        &self,
+        json: &[u8],
+    ) -> Result<super::idb_store::WalletSnapshot, Error> {
+        use bdk_wallet::{KeychainKind, bitcoin::Network, descriptor::ExtendedDescriptor};
+        use serde::de::IgnoredAny;
+
+        #[derive(Deserialize)]
+        struct Identity {
+            descriptor: ExtendedDescriptor,
+            change_descriptor: ExtendedDescriptor,
+            network: Network,
+        }
+        // Only beta.3 emitted these three separate stock components. Do not accept
+        // a damaged current backup or a mixture of the two formats as legacy.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Beta3Backup<'a> {
+            bdk_changeset: Identity,
+            #[serde(rename = "db")]
+            _db: IgnoredAny,
+            #[serde(rename = "stock_stash_b64")]
+            _stash: &'a str,
+            #[serde(rename = "stock_state_b64")]
+            _state: &'a str,
+            #[serde(rename = "stock_index_b64")]
+            _index: &'a str,
+            #[serde(default, rename = "reuse_address_index")]
+            _reuse: IgnoredAny,
+        }
+        let json = std::str::from_utf8(json).map_err(|_| Error::InvalidBackup)?;
+        let backup: Beta3Backup = serde_json::from_str(json).map_err(|_| Error::InvalidBackup)?;
+        // Conversion rebuilds the BDK wallet on the next full scan. Check the
+        // saved descriptors here before the legacy changeset is discarded.
+        let identity = backup.bdk_changeset;
+        if identity.network != self.bdk_wallet.network()
+            || &identity.descriptor != self.bdk_wallet.public_descriptor(KeychainKind::External)
+            || &identity.change_descriptor
+                != self.bdk_wallet.public_descriptor(KeychainKind::Internal)
+        {
+            return Err(Error::InvalidBackup);
+        }
+        self.convert_legacy_snapshot(json)
+            .map_err(|_| Error::InvalidBackup)?
+            .ok_or(Error::InvalidBackup)
     }
 
     /// Returns true if the wallet has been modified since the last backup.
