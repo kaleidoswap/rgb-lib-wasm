@@ -148,7 +148,7 @@ jobs:
 
   publish:
     name: Publish to npm
-    needs: release
+    needs: [release, verify]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -171,6 +171,8 @@ jobs:
 
       - name: Publish
         working-directory: pkg
-        run: npm publish --access public --provenance
+        run: npm publish --access public --provenance --tag "$NPM_DIST_TAG"
         env:
+          # Keep this backport available to 3.x consumers while latest follows 4.x.
+          NPM_DIST_TAG: ${{ needs.verify.outputs.version == '1.0.0-ks.3.2' && 'ks-3' || 'latest' }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
