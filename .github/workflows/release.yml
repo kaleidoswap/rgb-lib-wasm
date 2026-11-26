@@ -35,7 +35,7 @@ jobs:
           VERSION="${{ inputs.version }}"
           node -e "
             const pkg = require('./package.json');
-            pkg.name = '@kaleidorg/rgb-lib-wasm';
+            pkg.name = '@kaleidoswap/rgb-lib-wasm';
             pkg.version = '$VERSION';
             pkg.repository = { type: 'git', url: 'https://github.com/kaleidoswap/rgb-lib-wasm.git' };
             require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
@@ -107,7 +107,7 @@ jobs:
             ### Installation
             
             ```bash
-            npm install @kaleidorg/rgb-lib-wasm@${{ steps.version.outputs.version }}
+            npm install @kaleidoswap/rgb-lib-wasm@${{ steps.version.outputs.version }}
             ```
           draft: false
           prerelease: ${{ contains(steps.version.outputs.version, '-') }}
